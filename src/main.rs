@@ -5,13 +5,13 @@
 //! - Hover: klappt animiert auf (Uhrzeit + Datum)
 //! - Rechtsklick: beenden
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount64};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -25,13 +25,15 @@ const TOP_MARGIN: i32 = 8;
 
 const TIMER_ID: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const EXPAND_DURATION_MS: u64 = 320;
+const COLLAPSE_DURATION_MS: u64 = 260;
 
-static CUR_W: AtomicI32 = AtomicI32::new(0);
-static CUR_H: AtomicI32 = AtomicI32::new(0);
 static EXPANDED: AtomicBool = AtomicBool::new(false);
 static TRACKING: AtomicBool = AtomicBool::new(false);
 static LAST_SEC: AtomicI32 = AtomicI32::new(-1);
 static SCALE_PCT: AtomicI32 = AtomicI32::new(100);
+static ANIMATION_FROM: AtomicI32 = AtomicI32::new(0);
+static ANIMATION_STARTED: AtomicI64 = AtomicI64::new(0);
 
 fn scaled(v: i32) -> i32 {
     v * SCALE_PCT.load(Ordering::Relaxed) / 100
@@ -53,9 +55,6 @@ fn main() -> windows::core::Result<()> {
             ..Default::default()
         };
         RegisterClassW(&wc);
-
-        CUR_W.store(scaled(COLLAPSED_W), Ordering::Relaxed);
-        CUR_H.store(scaled(COLLAPSED_H), Ordering::Relaxed);
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -96,18 +95,48 @@ unsafe fn apply_geometry(hwnd: HWND, w: i32, h: i32) {
     let _ = SetWindowRgn(hwnd, rgn, true);
 }
 
-/// Ein Schritt Richtung Ziel (weiches Easing).
-fn step(cur: i32, target: i32) -> i32 {
-    if cur == target {
-        return cur;
-    }
-    let delta = (target - cur) as f32 * 0.22;
-    let d = if delta.abs() < 1.0 {
-        (target - cur).signum()
+/// A quintic ease has zero velocity at both ends, avoiding a mechanical stop.
+fn smooth_step(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+fn animation_progress(now: u64) -> f32 {
+    let from = ANIMATION_FROM.load(Ordering::Relaxed) as f32 / 10_000.0;
+    let expanding = EXPANDED.load(Ordering::Relaxed);
+    let started = ANIMATION_STARTED.load(Ordering::Relaxed).max(0) as u64;
+    let duration = if expanding {
+        EXPAND_DURATION_MS
     } else {
-        delta.round() as i32
+        COLLAPSE_DURATION_MS
     };
-    cur + d
+    let eased = smooth_step(now.saturating_sub(started) as f32 / duration as f32);
+
+    if expanding {
+        from + (1.0 - from) * eased
+    } else {
+        from * (1.0 - eased)
+    }
+}
+
+/// Retarget from the current in-between value, so edge crossings never snap.
+unsafe fn set_expanded(expanded: bool) {
+    if EXPANDED.load(Ordering::Relaxed) == expanded {
+        return;
+    }
+    let now = GetTickCount64();
+    let current = animation_progress(now);
+    ANIMATION_FROM.store((current * 10_000.0).round() as i32, Ordering::Relaxed);
+    ANIMATION_STARTED.store(now as i64, Ordering::Relaxed);
+    EXPANDED.store(expanded, Ordering::Relaxed);
+}
+
+fn lerp_i32(from: i32, to: i32, progress: f32) -> i32 {
+    (from as f32 + (to - from) as f32 * progress).round() as i32
+}
+
+fn lerp_color(from: u8, to: u8, progress: f32) -> u8 {
+    lerp_i32(from as i32, to as i32, progress) as u8
 }
 
 unsafe fn draw_text(hdc: HDC, text: &str, rect: &mut RECT, height: i32, weight: i32) {
@@ -158,25 +187,41 @@ unsafe fn paint(hwnd: HWND) {
     let time = format!("{:02}:{:02}", t.wHour, t.wMinute);
 
     // Fortschritt der Animation (0.0 = klein, 1.0 = groß)
-    let span = (scaled(EXPANDED_H) - scaled(COLLAPSED_H)).max(1) as f32;
-    let progress = ((h - scaled(COLLAPSED_H)) as f32 / span).clamp(0.0, 1.0);
+    let progress = animation_progress(GetTickCount64());
 
-    if progress < 0.5 {
-        draw_text(mem, &time, &mut rc, h / 2, 600);
-    } else {
-        const DAYS: [&str; 7] = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
-        let date = format!(
-            "{} {:02}.{:02}.{}",
-            DAYS[(t.wDayOfWeek as usize) % 7],
-            t.wDay,
-            t.wMonth,
-            t.wYear
-        );
-        let mut top = RECT { left: 0, top: h / 10, right: w, bottom: h * 6 / 10 };
-        let mut bottom = RECT { left: 0, top: h * 6 / 10, right: w, bottom: h - h / 10 };
-        draw_text(mem, &time, &mut top, h * 40 / 100, 600);
-        SetTextColor(mem, COLORREF(0x00B4_B4B4));
-        draw_text(mem, &date, &mut bottom, h * 18 / 100, 400);
+    let mut time_rect = RECT {
+        left: 0,
+        top: lerp_i32(0, h / 10, progress),
+        right: w,
+        bottom: lerp_i32(h, h * 6 / 10, progress),
+    };
+    draw_text(
+        mem,
+        &time,
+        &mut time_rect,
+        lerp_i32(h / 2, h * 40 / 100, progress),
+        600,
+    );
+
+    const DAYS: [&str; 7] = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+    let date = format!(
+        "{} {:02}.{:02}.{}",
+        DAYS[(t.wDayOfWeek as usize) % 7],
+        t.wDay,
+        t.wMonth,
+        t.wYear
+    );
+    let date_fade = smooth_step(((progress - 0.28) / 0.72).clamp(0.0, 1.0));
+    if date_fade > 0.0 {
+        let mut date_rect = RECT {
+            left: 0,
+            top: h * 6 / 10,
+            right: w,
+            bottom: h - h / 10,
+        };
+        let grey = lerp_color(0, 180, date_fade) as u32;
+        SetTextColor(mem, COLORREF(grey | (grey << 8) | (grey << 16)));
+        draw_text(mem, &date, &mut date_rect, h * 18 / 100, 400);
     }
 
     let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -191,29 +236,33 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     unsafe {
         match msg {
             WM_TIMER => {
-                let (tw, th) = if EXPANDED.load(Ordering::Relaxed) {
-                    (scaled(EXPANDED_W), scaled(EXPANDED_H))
+                let progress = animation_progress(GetTickCount64());
+                let nw = lerp_i32(scaled(COLLAPSED_W), scaled(EXPANDED_W), progress);
+                let nh = lerp_i32(scaled(COLLAPSED_H), scaled(EXPANDED_H), progress);
+                let target = if EXPANDED.load(Ordering::Relaxed) {
+                    1.0
                 } else {
-                    (scaled(COLLAPSED_W), scaled(COLLAPSED_H))
+                    0.0
                 };
-                let (cw, ch) = (CUR_W.load(Ordering::Relaxed), CUR_H.load(Ordering::Relaxed));
-                let (nw, nh) = (step(cw, tw), step(ch, th));
+                let animating = (progress - target).abs() > 0.0001;
+                let mut current_rect = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut current_rect);
+                let cw = current_rect.right - current_rect.left;
+                let ch = current_rect.bottom - current_rect.top;
 
                 let sec = GetLocalTime().wMinute as i32 * 100 + GetLocalTime().wSecond as i32;
                 let sec_changed = LAST_SEC.swap(sec, Ordering::Relaxed) != sec;
 
                 if nw != cw || nh != ch {
-                    CUR_W.store(nw, Ordering::Relaxed);
-                    CUR_H.store(nh, Ordering::Relaxed);
                     apply_geometry(hwnd, nw, nh);
                     let _ = InvalidateRect(hwnd, None, false);
-                } else if sec_changed {
+                } else if sec_changed || animating {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                EXPANDED.store(true, Ordering::Relaxed);
+                set_expanded(true);
                 if !TRACKING.swap(true, Ordering::Relaxed) {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -227,7 +276,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_MOUSELEAVE => {
                 TRACKING.store(false, Ordering::Relaxed);
-                EXPANDED.store(false, Ordering::Relaxed);
+                set_expanded(false);
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
