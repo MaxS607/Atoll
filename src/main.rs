@@ -34,6 +34,12 @@ static LAST_SEC: AtomicI32 = AtomicI32::new(-1);
 static SCALE_PCT: AtomicI32 = AtomicI32::new(100);
 static ANIMATION_FROM: AtomicI32 = AtomicI32::new(0);
 static ANIMATION_STARTED: AtomicI64 = AtomicI64::new(0);
+// The timer publishes one state for both native geometry and paint.  Sampling
+// the clock independently in WM_PAINT can otherwise draw a frame ahead of the
+// resized surface.
+static RENDER_PROGRESS: AtomicI32 = AtomicI32::new(0);
+static CUR_W: AtomicI32 = AtomicI32::new(0);
+static CUR_H: AtomicI32 = AtomicI32::new(0);
 
 fn scaled(v: i32) -> i32 {
     v * SCALE_PCT.load(Ordering::Relaxed) / 100
@@ -55,6 +61,9 @@ fn main() -> windows::core::Result<()> {
             ..Default::default()
         };
         RegisterClassW(&wc);
+
+        CUR_W.store(scaled(COLLAPSED_W), Ordering::Relaxed);
+        CUR_H.store(scaled(COLLAPSED_H), Ordering::Relaxed);
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -89,7 +98,15 @@ unsafe fn apply_geometry(hwnd: HWND, w: i32, h: i32) {
     let screen_w = GetSystemMetrics(SM_CXSCREEN);
     let x = (screen_w - w) / 2;
     let y = scaled(TOP_MARGIN);
-    let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        x,
+        y,
+        w,
+        h,
+        SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+    );
     let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, h.min(scaled(44)), h.min(scaled(44)));
     // Windows übernimmt das Region-Handle
     let _ = SetWindowRgn(hwnd, rgn, true);
@@ -186,8 +203,7 @@ unsafe fn paint(hwnd: HWND) {
     let t = GetLocalTime();
     let time = format!("{:02}:{:02}", t.wHour, t.wMinute);
 
-    // Fortschritt der Animation (0.0 = klein, 1.0 = groß)
-    let progress = animation_progress(GetTickCount64());
+    let progress = RENDER_PROGRESS.load(Ordering::Relaxed) as f32 / 10_000.0;
 
     let mut time_rect = RECT {
         left: 0,
@@ -237,6 +253,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         match msg {
             WM_TIMER => {
                 let progress = animation_progress(GetTickCount64());
+                RENDER_PROGRESS.store((progress * 10_000.0).round() as i32, Ordering::Relaxed);
                 let nw = lerp_i32(scaled(COLLAPSED_W), scaled(EXPANDED_W), progress);
                 let nh = lerp_i32(scaled(COLLAPSED_H), scaled(EXPANDED_H), progress);
                 let target = if EXPANDED.load(Ordering::Relaxed) {
@@ -245,16 +262,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     0.0
                 };
                 let animating = (progress - target).abs() > 0.0001;
-                let mut current_rect = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut current_rect);
-                let cw = current_rect.right - current_rect.left;
-                let ch = current_rect.bottom - current_rect.top;
+                let cw = CUR_W.load(Ordering::Relaxed);
+                let ch = CUR_H.load(Ordering::Relaxed);
 
                 let sec = GetLocalTime().wMinute as i32 * 100 + GetLocalTime().wSecond as i32;
                 let sec_changed = LAST_SEC.swap(sec, Ordering::Relaxed) != sec;
 
                 if nw != cw || nh != ch {
                     apply_geometry(hwnd, nw, nh);
+                    CUR_W.store(nw, Ordering::Relaxed);
+                    CUR_H.store(nh, Ordering::Relaxed);
                     let _ = InvalidateRect(hwnd, None, false);
                 } else if sec_changed || animating {
                     let _ = InvalidateRect(hwnd, None, false);
