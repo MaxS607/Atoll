@@ -105,7 +105,7 @@ unsafe fn apply_geometry(hwnd: HWND, w: i32, h: i32) {
         y,
         w,
         h,
-        SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+        SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOCOPYBITS,
     );
     let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, h.min(scaled(44)), h.min(scaled(44)));
     // Windows übernimmt das Region-Handle
@@ -211,13 +211,9 @@ unsafe fn paint(hwnd: HWND) {
         right: w,
         bottom: lerp_i32(h, h * 6 / 10, progress),
     };
-    draw_text(
-        mem,
-        &time,
-        &mut time_rect,
-        lerp_i32(h / 2, h * 40 / 100, progress),
-        600,
-    );
+    // Keep the glyph raster size fixed. Resizing a ClearType font every frame
+    // changes its hinting and can read as a one-frame text jump.
+    draw_text(mem, &time, &mut time_rect, scaled(18), 600);
 
     const DAYS: [&str; 7] = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
     let date = format!(
@@ -237,7 +233,7 @@ unsafe fn paint(hwnd: HWND) {
         };
         let grey = lerp_color(0, 180, date_fade) as u32;
         SetTextColor(mem, COLORREF(grey | (grey << 8) | (grey << 16)));
-        draw_text(mem, &date, &mut date_rect, h * 18 / 100, 400);
+        draw_text(mem, &date, &mut date_rect, scaled(14), 400);
     }
 
     let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -272,7 +268,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     apply_geometry(hwnd, nw, nh);
                     CUR_W.store(nw, Ordering::Relaxed);
                     CUR_H.store(nh, Ordering::Relaxed);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = RedrawWindow(
+                        hwnd,
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE,
+                    );
                 } else if sec_changed || animating {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
