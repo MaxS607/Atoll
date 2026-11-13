@@ -12,7 +12,8 @@
 //!  * Time comes from QueryPerformanceCounter, frames are paced by DwmFlush
 //!    (the compositor's vblank), and the motion is a critically damped spring
 //!    that can be interrupted at any moment without snapping.
-//!  * One progress value drives geometry, text position and fade in every frame.
+//!  * One progress value drives geometry and date fade in every frame; the clock
+//!    remains anchored while the pill expands.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +45,6 @@ const DATE_FONT: f32 = 14.0;
 const TIME_BOX_H: f32 = 28.0;
 const DATE_BOX_H: f32 = 22.0;
 const TIME_TOP_COLLAPSED: f32 = (COLLAPSED_H - TIME_BOX_H) / 2.0;
-const TIME_TOP_EXPANDED: f32 = 16.0;
 const DATE_TOP_EXPANDED: f32 = 58.0;
 const DATE_SLIDE: f32 = 8.0; // date slides up this far while fading in
 
@@ -257,9 +257,10 @@ impl Renderer {
         let cy = ph / 2.0;
         let (hx, hy) = (pw / 2.0 - rad, ph / 2.0 - rad);
 
-        // Text layout, all derived from the same p.
+        // Keep the clock anchored at its collapsed position. Only the date
+        // animates into view as the pill expands.
         let fade = smooth_step((p - 0.28) / 0.72);
-        let time_top = lerp(TIME_TOP_COLLAPSED, TIME_TOP_EXPANDED, p) * s;
+        let time_top = TIME_TOP_COLLAPSED * s;
         let date_top = (DATE_TOP_EXPANDED + (1.0 - fade) * DATE_SLIDE) * s;
         let time_dy = (time_top * SS as f32).round() as i32;
         let date_dy = (date_top * SS as f32).round() as i32;
@@ -388,7 +389,8 @@ fn main() -> windows::core::Result<()> {
         let mut vel = 0.0f32;
         let mut last = qpc();
         let mut was_animating = false;
-        let mut last_key_check = r.key;
+        let initial_time = GetLocalTime();
+        let mut last_minute_key = initial_time.wHour as u32 * 60 + initial_time.wMinute as u32;
 
         let mut msg = MSG::default();
         loop {
@@ -436,8 +438,8 @@ fn main() -> windows::core::Result<()> {
             let t = GetLocalTime();
             let minute_key = t.wHour as u32 * 60 + t.wMinute as u32;
 
-            if animating || was_animating || minute_key != last_key_check {
-                last_key_check = minute_key;
+            if animating || was_animating || minute_key != last_minute_key {
+                last_minute_key = minute_key;
                 r.draw(hwnd, pos.clamp(0.0, 1.0));
             }
             was_animating = animating;
