@@ -22,10 +22,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::core::{w, PCWSTR};
-use windows::Foundation::{AsyncStatus, EventRegistrationToken, IAsyncOperation, TypedEventHandler};
+use windows::Foundation::{
+    AsyncStatus, EventRegistrationToken, IAsyncOperation, TypedEventHandler,
+};
 use windows::Graphics::Imaging::{
-    BitmapAlphaMode, BitmapBounds, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat, BitmapTransform,
-    ColorManagementMode, ExifOrientationMode,
+    BitmapAlphaMode, BitmapBounds, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat,
+    BitmapTransform, ColorManagementMode, ExifOrientationMode,
 };
 use windows::Media::Control::{
     CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSession,
@@ -47,7 +49,9 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::SystemInformation::{GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows::Win32::System::SystemInformation::{
+    GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+};
 use windows::Win32::System::Threading::{CreateMutexW, GetSystemTimes, Sleep};
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -60,78 +64,78 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ---- Layout (logical pixels at 96 DPI) -------------------------------------
-const COLLAPSED_W: f32 = 112.0;
-const COLLAPSED_W_MEDIA: f32 = 142.0; // collapsed pill is wider while a media session exists
+const COLLAPSED_W: f32 = 80.0;
+const COLLAPSED_W_MEDIA: f32 = 110.0; // collapsed pill is wider while a media session exists
 const COLLAPSED_H: f32 = 34.0;
-const EXPANDED_W: f32  = 340.0;
-const EXPANDED_H: f32  = 114.0;
-const TOP_MARGIN: f32  = 8.0;
-const MAX_RADIUS: f32  = 26.0;
+const EXPANDED_W: f32 = 400.0;
+const EXPANDED_H: f32 = 114.0;
+const TOP_MARGIN: f32 = 8.0;
+const MAX_RADIUS: f32 = 26.0;
 
-const TIME_FONT: f32    = 20.0;
-const DATE_FONT: f32    = 12.5;
-const TIME_BOX_H: f32   = 28.0;
-const DATE_BOX_H: f32   = 22.0;
+const TIME_FONT: f32 = 16.0;
+const DATE_FONT: f32 = 12.5;
+const TIME_BOX_H: f32 = 28.0;
+const DATE_BOX_H: f32 = 22.0;
 const TIME_TOP_COLLAPSED: f32 = (COLLAPSED_H - TIME_BOX_H) / 2.0;
-const DATE_TOP_EXPANDED: f32  = 89.0;
-const DATE_SLIDE: f32   = 8.0; // content slides up this far while fading in
+const DATE_TOP_EXPANDED: f32 = 89.0;
+const DATE_SLIDE: f32 = 8.0; // content slides up this far while fading in
 
 // ---- Widgets (CPU & RAM rings, stacked on the right) ------------------------
-const RING_CX: f32        = 269.0; // ring centre X
-const RING_CY1: f32       = 43.0;  // CPU ring centre Y
-const RING_CY2: f32       = 86.0;  // RAM ring centre Y
-const RING_R: f32         = 15.0;
-const RING_THICKNESS: f32 = 3.5;
-const LABEL_CX: f32       = 311.0; // centre X of the "CPU" / "RAM" labels
+const RING_CX: f32 = 320.0; // ring centre X
+const RING_CY1: f32 = 38.0; // CPU ring centre Y
+const RING_CY2: f32 = 78.0; // RAM ring centre Y
+const RING_R: f32 = 16.0;
+const RING_THICKNESS: f32 = 5.0;
+const LABEL_CX: f32 = 370.0; // centre X of the "CPU" / "RAM" labels
 
-const PCT_FONT: f32   = 10.0;
-const LBL_FONT: f32   = 10.5;
-const PCT_BOX_W: f32  = 32.0;
-const PCT_BOX_H: f32  = 16.0;
-const LBL_BOX_W: f32  = 36.0;
-const LBL_BOX_H: f32  = 16.0;
+const PCT_FONT: f32 = 10.0;
+const LBL_FONT: f32 = 10.5;
+const PCT_BOX_W: f32 = 32.0;
+const PCT_BOX_H: f32 = 16.0;
+const LBL_BOX_W: f32 = 36.0;
+const LBL_BOX_H: f32 = 16.0;
 
 // ---- Media: album art, title, slider, controls ------------------------------
 // Expanded album art (also the animation target of the collapsed cover)
-const ALBUM_ART_X: f32    = 13.0;
-const ALBUM_ART_Y: f32    = 26.0;
-const ALBUM_ART_SIZE: f32 = 62.0;
-const ALBUM_ART_RADIUS: f32 = 15.0;
+const ALBUM_ART_X: f32 = 12.0;
+const ALBUM_ART_Y: f32 = 12.0;
+const ALBUM_ART_SIZE: f32 = 90.0;
+const ALBUM_ART_RADIUS: f32 = 14.0;
 
 // Collapsed cover (left edge of the pill)
-const COLL_ART_SIZE: f32   = 24.0;
-const COLL_ART_PAD: f32    = 5.0;
-const COLL_ART_RADIUS: f32 = 6.0;
+const COLL_ART_SIZE: f32 = 24.0;
+const COLL_ART_PAD: f32 = 5.0;
+const COLL_ART_RADIUS: f32 = 12.0;
 
 // Collapsed audio visualizer (right side of the pill)
 const VIZ_RIGHT_PAD: f32 = 19.0;
 
-const MEDIA_TEXT_X: f32   = 85.0;
-const MEDIA_TEXT_W: f32   = 141.0;
-const MEDIA_TITLE_H: f32  = 20.0;
-const MEDIA_TITLE_CY: f32 = 43.0;
+const MEDIA_TEXT_X: f32 = 120.0;
+const MEDIA_TEXT_W: f32 = 140.0;
+const MEDIA_TITLE_H: f32 = 20.0;
+const MEDIA_TITLE_CY: f32 = 40.0;
 
-const SLIDER_X0: f32 = 85.0;
-const SLIDER_X1: f32 = 226.0;
-const SLIDER_Y: f32  = 56.0;
-const SLIDER_H: f32  = 3.5;
+const SLIDER_X0: f32 = 120.0;
+const SLIDER_X1: f32 = 280.0;
+const SLIDER_Y: f32 = 56.0;
+const SLIDER_H: f32 = 5.0;
 
 const BTN_HIT_R: f32 = 12.0; // play button hover circle radius
 const BTN_SEC_R: f32 = 12.0; // prev/next hover circle radius
 
-const CX_PREV: f32 = 131.0;
-const CX_PLAY: f32 = 155.0;
-const CX_NEXT: f32 = 179.0;
-const CY_BTN: f32  = 76.0;
+const CX_PREV: f32 = 170.0;
+const CX_PLAY: f32 = 200.0;
+const CX_NEXT: f32 = 230.0;
+const CY_BTN: f32 = 76.0;
 
 // Hit-testing / drawing bands (logical px)
 const SLIDER_HIT_HALF_H: f32 = 8.0; // vertical hit zone around the slider
-const SLIDER_HIT_PAD: f32    = 4.0; // horizontal slack at both slider ends
-const SLIDER_BAND: f32       = 9.0; // rows scanned around the slider when drawing
-const VIZ_BAND: f32          = 14.0; // rows scanned around the collapsed visualizer
-const KNOB_R: f32            = 4.5;
-const KNOB_R_HOVER: f32      = 5.5;
-const MEDIA_TITLE_FONT: f32  = 12.5;
+const SLIDER_HIT_PAD: f32 = 4.0; // horizontal slack at both slider ends
+const SLIDER_BAND: f32 = 9.0; // rows scanned around the slider when drawing
+const VIZ_BAND: f32 = 14.0; // rows scanned around the collapsed visualizer
+const KNOB_R: f32 = 4.5;
+const KNOB_R_HOVER: f32 = 5.5;
+const MEDIA_TITLE_FONT: f32 = 12.5;
 const STALE_TIMELINE_SECS: f64 = 6.0 * 3600.0; // ignore timeline updates older than this
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1000); // safety refresh of media state
 const ID_QUIT: usize = 1;
@@ -151,7 +155,7 @@ const NO_PRESS: u8 = 255;
 static PRESSED_BTN: AtomicU8 = AtomicU8::new(NO_PRESS); // button that received WM_LBUTTONDOWN
 static SCALE_BITS: AtomicU32 = AtomicU32::new(0x3F80_0000); // f32 1.0: DPI scale of the window
 static RESCALE: AtomicBool = AtomicBool::new(false); // set by WM_DPICHANGED
-// Wakes the media thread when something happened (event, command, seek).
+                                                     // Wakes the media thread when something happened (event, command, seek).
 static WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
 fn scale() -> f32 {
@@ -327,7 +331,10 @@ fn thumb_changed(a: &Option<Arc<Vec<u8>>>, b: &Option<Arc<Vec<u8>>>) -> bool {
     }
 }
 
-fn decode_thumbnail(thumb_ref: &IRandomAccessStreamReference, size: u32) -> Option<(u32, u32, Vec<u8>)> {
+fn decode_thumbnail(
+    thumb_ref: &IRandomAccessStreamReference,
+    size: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
     let stream = wait_timeout(&thumb_ref.OpenReadAsync().ok()?, ASYNC_TIMEOUT)?;
     let decoder = wait_timeout(&BitmapDecoder::CreateAsync(&stream).ok()?, ASYNC_TIMEOUT)?;
     let (iw, ih) = (decoder.PixelWidth().ok()?, decoder.PixelHeight().ok()?);
@@ -336,9 +343,16 @@ fn decode_thumbnail(thumb_ref: &IRandomAccessStreamReference, size: u32) -> Opti
     transform.SetScaledWidth(sw).ok()?;
     transform.SetScaledHeight(sh).ok()?;
     transform
-        .SetBounds(BitmapBounds { X: cx, Y: cy, Width: size, Height: size })
+        .SetBounds(BitmapBounds {
+            X: cx,
+            Y: cy,
+            Width: size,
+            Height: size,
+        })
         .ok()?;
-    transform.SetInterpolationMode(BitmapInterpolationMode::Linear).ok()?;
+    transform
+        .SetInterpolationMode(BitmapInterpolationMode::Linear)
+        .ok()?;
     let pixel_data = wait_timeout(
         &decoder
             .GetPixelDataTransformedAsync(
@@ -370,12 +384,12 @@ impl Subscription {
     fn new(session: &GlobalSystemMediaTransportControlsSession, app_id: String) -> Option<Self> {
         type S = GlobalSystemMediaTransportControlsSession;
         let props = session
-            .MediaPropertiesChanged(&TypedEventHandler::<S, MediaPropertiesChangedEventArgs>::new(
-                |_, _| {
+            .MediaPropertiesChanged(
+                &TypedEventHandler::<S, MediaPropertiesChangedEventArgs>::new(|_, _| {
                     wake_media_thread();
                     Ok(())
-                },
-            ))
+                }),
+            )
             .ok()?;
         let playback = session
             .PlaybackInfoChanged(&TypedEventHandler::<S, PlaybackInfoChangedEventArgs>::new(
@@ -441,10 +455,12 @@ impl MediaController {
                         let _ = mgr.CurrentSessionChanged(&TypedEventHandler::<
                             GlobalSystemMediaTransportControlsSessionManager,
                             CurrentSessionChangedEventArgs,
-                        >::new(|_, _| {
-                            wake_media_thread();
-                            Ok(())
-                        }));
+                        >::new(
+                            |_, _| {
+                                wake_media_thread();
+                                Ok(())
+                            },
+                        ));
                     }
                 }
 
@@ -460,7 +476,10 @@ impl MediaController {
                             .SourceAppUserModelId()
                             .map(|a| a.to_string_lossy())
                             .unwrap_or_default();
-                        if subscription.as_ref().map_or(true, |sub| sub.app_id != app_id) {
+                        if subscription
+                            .as_ref()
+                            .map_or(true, |sub| sub.app_id != app_id)
+                        {
                             if let Some(old) = subscription.take() {
                                 old.cancel();
                             }
@@ -513,8 +532,14 @@ impl MediaController {
                             .ok()
                             .and_then(|op| wait_timeout(&op, ASYNC_TIMEOUT))
                             .map(|props| {
-                                let t = props.Title().map(|s| s.to_string_lossy()).unwrap_or_default();
-                                let a = props.Artist().map(|s| s.to_string_lossy()).unwrap_or_default();
+                                let t = props
+                                    .Title()
+                                    .map(|s| s.to_string_lossy())
+                                    .unwrap_or_default();
+                                let a = props
+                                    .Artist()
+                                    .map(|s| s.to_string_lossy())
+                                    .unwrap_or_default();
                                 let thumb = props.Thumbnail().ok();
                                 (t, a, thumb)
                             })
@@ -555,7 +580,11 @@ impl MediaController {
                             position_secs = position_secs.min(duration_secs);
                         }
 
-                        if is_new_track || thumb_changed_now || is_playing != last_playing || !last_has_session {
+                        if is_new_track
+                            || thumb_changed_now
+                            || is_playing != last_playing
+                            || !last_has_session
+                        {
                             last_title = title.clone();
                             last_artist = artist.clone();
                             last_playing = is_playing;
@@ -693,7 +722,8 @@ impl SystemMonitor {
             if GlobalMemoryStatusEx(&mut mem).is_ok() {
                 if mem.ullTotalPhys > 0 {
                     let used = mem.ullTotalPhys.saturating_sub(mem.ullAvailPhys);
-                    self.ram_usage = ((used as f64 / mem.ullTotalPhys as f64) as f32).clamp(0.0, 1.0);
+                    self.ram_usage =
+                        ((used as f64 / mem.ullTotalPhys as f64) as f32).clamp(0.0, 1.0);
                 } else {
                     self.ram_usage = (mem.dwMemoryLoad as f32 / 100.0).clamp(0.0, 1.0);
                 }
@@ -747,7 +777,7 @@ fn get_cpu_color(pct: f32) -> (f32, f32, f32) {
     } else if pct < 0.85 {
         (251.0, 191.0, 36.0) // Amber
     } else {
-        (244.0, 63.0, 94.0)  // Coral red
+        (244.0, 63.0, 94.0) // Coral red
     }
 }
 
@@ -757,7 +787,7 @@ fn get_ram_color(pct: f32) -> (f32, f32, f32) {
     } else if pct < 0.88 {
         (251.0, 146.0, 60.0) // Orange
     } else {
-        (244.0, 63.0, 94.0)  // Coral red
+        (244.0, 63.0, 94.0) // Coral red
     }
 }
 
@@ -869,7 +899,12 @@ fn rounded_poly(pts: &[(f32, f32)], r: f32) -> String {
         d.push_str(&format!(
             "{}{:.3} {:.3} Q{:.3} {:.3} {:.3} {:.3} ",
             if i == 0 { "M" } else { "L" },
-            a.0, a.1, cur.0, cur.1, b.0, b.1
+            a.0,
+            a.1,
+            cur.0,
+            cur.1,
+            b.0,
+            b.1
         ));
     }
     d.push('Z');
@@ -950,7 +985,9 @@ fn parse_svg_path(d: &str) -> Vec<Vec<(f32, f32)>> {
         let (ox, oy) = if rel { (x, y) } else { (0.0, 0.0) };
         match cmd.to_ascii_uppercase() {
             'M' => {
-                let Some(v) = take_nums(&toks, &mut idx, 2) else { break };
+                let Some(v) = take_nums(&toks, &mut idx, 2) else {
+                    break;
+                };
                 if !cur.is_empty() {
                     polys.push(std::mem::take(&mut cur));
                 }
@@ -962,23 +999,31 @@ fn parse_svg_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                 cmd = if rel { 'l' } else { 'L' };
             }
             'L' => {
-                let Some(v) = take_nums(&toks, &mut idx, 2) else { break };
+                let Some(v) = take_nums(&toks, &mut idx, 2) else {
+                    break;
+                };
                 x = ox + v[0];
                 y = oy + v[1];
                 cur.push((x, y));
             }
             'H' => {
-                let Some(v) = take_nums(&toks, &mut idx, 1) else { break };
+                let Some(v) = take_nums(&toks, &mut idx, 1) else {
+                    break;
+                };
                 x = ox + v[0];
                 cur.push((x, y));
             }
             'V' => {
-                let Some(v) = take_nums(&toks, &mut idx, 1) else { break };
+                let Some(v) = take_nums(&toks, &mut idx, 1) else {
+                    break;
+                };
                 y = oy + v[0];
                 cur.push((x, y));
             }
             'Q' => {
-                let Some(v) = take_nums(&toks, &mut idx, 4) else { break };
+                let Some(v) = take_nums(&toks, &mut idx, 4) else {
+                    break;
+                };
                 let (c1x, c1y, ex, ey) = (ox + v[0], oy + v[1], ox + v[2], oy + v[3]);
                 for k in 1..=STEPS {
                     let t = k as f32 / STEPS as f32;
@@ -992,7 +1037,9 @@ fn parse_svg_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                 y = ey;
             }
             'C' => {
-                let Some(v) = take_nums(&toks, &mut idx, 6) else { break };
+                let Some(v) = take_nums(&toks, &mut idx, 6) else {
+                    break;
+                };
                 let (c1x, c1y) = (ox + v[0], oy + v[1]);
                 let (c2x, c2y) = (ox + v[2], oy + v[3]);
                 let (ex, ey) = (ox + v[4], oy + v[5]);
@@ -1000,8 +1047,14 @@ fn parse_svg_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                     let t = k as f32 / STEPS as f32;
                     let u = 1.0 - t;
                     cur.push((
-                        u * u * u * x + 3.0 * u * u * t * c1x + 3.0 * u * t * t * c2x + t * t * t * ex,
-                        u * u * u * y + 3.0 * u * u * t * c1y + 3.0 * u * t * t * c2y + t * t * t * ey,
+                        u * u * u * x
+                            + 3.0 * u * u * t * c1x
+                            + 3.0 * u * t * t * c2x
+                            + t * t * t * ex,
+                        u * u * u * y
+                            + 3.0 * u * u * t * c1y
+                            + 3.0 * u * t * t * c2y
+                            + t * t * t * ey,
                     ));
                 }
                 x = ex;
@@ -1162,8 +1215,24 @@ fn sample_thumb(pix: &[u8], u: f32, v: f32) -> (f32, f32, f32) {
 fn sample_note_icon(fx: f32, fy: f32, cx: f32, cy: f32, size: f32) -> f32 {
     let head1 = sdf_circle_cov(fx, fy, cx - size * 0.35, cy + size * 0.55, size * 0.28);
     let head2 = sdf_circle_cov(fx, fy, cx + size * 0.35, cy + size * 0.55, size * 0.28);
-    let stem  = sdf_rounded_box_cov(fx, fy, cx - size * 0.07, cy - size * 0.05, size * 0.06, size * 0.60, size * 0.04);
-    let beam  = sdf_rounded_box_cov(fx, fy, cx + size * 0.14, cy - size * 0.60, size * 0.28, size * 0.07, size * 0.04);
+    let stem = sdf_rounded_box_cov(
+        fx,
+        fy,
+        cx - size * 0.07,
+        cy - size * 0.05,
+        size * 0.06,
+        size * 0.60,
+        size * 0.04,
+    );
+    let beam = sdf_rounded_box_cov(
+        fx,
+        fy,
+        cx + size * 0.14,
+        cy - size * 0.60,
+        size * 0.28,
+        size * 0.07,
+        size * 0.04,
+    );
     (head1 + head2 + stem + beam).min(1.0)
 }
 
@@ -1184,7 +1253,14 @@ fn make_bmi(w: i32, h: i32) -> BITMAPINFO {
 
 /// Render `text` white-on-black with grayscale AA into a hi-res mask (0..255 coverage).
 unsafe fn render_mask(text: &str, font_px: i32, weight: i32, hw: i32, hh: i32) -> Vec<u8> {
-    render_mask_ex(text, font_px, weight, hw, hh, DT_CENTER | DT_VCENTER | DT_SINGLELINE)
+    render_mask_ex(
+        text,
+        font_px,
+        weight,
+        hw,
+        hh,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    )
 }
 
 unsafe fn render_mask_ex(
@@ -1199,7 +1275,8 @@ unsafe fn render_mask_ex(
     let dc = CreateCompatibleDC(screen);
     let bmi = make_bmi(hw, hh);
     let mut bits: *mut c_void = std::ptr::null_mut();
-    let Ok(bmp) = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) else {
+    let Ok(bmp) = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0)
+    else {
         // GDI is out of resources: draw nothing rather than crash the whole island.
         let _ = DeleteDC(dc);
         ReleaseDC(None, screen);
@@ -1234,12 +1311,7 @@ unsafe fn render_mask_ex(
         bottom: hh,
     };
     let mut wide: Vec<u16> = text.encode_utf16().collect();
-    DrawTextW(
-        dc,
-        &mut wide,
-        &mut rect,
-        flags,
-    );
+    DrawTextW(dc, &mut wide, &mut rect, flags);
     let _ = GdiFlush();
 
     let px = std::slice::from_raw_parts(bits as *const u32, (hw * hh) as usize);
@@ -1311,8 +1383,8 @@ unsafe fn locale_strings(t: &SYSTEMTIME) -> (String, String) {
         Some(&mut dbuf[..]),
         PCWSTR::null(),
     );
-    let day = text(&dbuf, n)
-        .unwrap_or_else(|| format!("{:02}.{:02}.{}", t.wDay, t.wMonth, t.wYear));
+    let day =
+        text(&dbuf, n).unwrap_or_else(|| format!("{:02}.{:02}.{}", t.wDay, t.wMonth, t.wYear));
 
     let date = match weekday {
         Some(w) => format!("{} {}", w, day),
@@ -1588,7 +1660,8 @@ impl Renderer {
         }
 
         // Sync album art from MediaInfo (a cheap Arc clone, only when the texture changed)
-        if (has_media || !media.has_session) && thumb_changed(&self.thumb_pixels, &media.thumbnail) {
+        if (has_media || !media.has_session) && thumb_changed(&self.thumb_pixels, &media.thumbnail)
+        {
             self.thumb_pixels = media.thumbnail.clone();
         }
 
@@ -1659,8 +1732,16 @@ impl Renderer {
 
         // ---- Album art: one rounded square that glides from the collapsed pill to its expanded spot ----
         let art_sz = lerp(COLL_ART_SIZE, ALBUM_ART_SIZE, p) * s;
-        let art_x = lerp(cx - coll_w * s / 2.0 + COLL_ART_PAD * s, ox + ALBUM_ART_X * s, p);
-        let art_cy = lerp(COLLAPSED_H / 2.0 * s, (ALBUM_ART_Y + ALBUM_ART_SIZE / 2.0) * s, p);
+        let art_x = lerp(
+            cx - coll_w * s / 2.0 + COLL_ART_PAD * s,
+            ox + ALBUM_ART_X * s,
+            p,
+        );
+        let art_cy = lerp(
+            COLLAPSED_H / 2.0 * s,
+            (ALBUM_ART_Y + ALBUM_ART_SIZE / 2.0) * s,
+            p,
+        );
         let art_y = art_cy - art_sz / 2.0;
         let art_cx = art_x + art_sz / 2.0;
         let art_r = lerp(COLL_ART_RADIUS, ALBUM_ART_RADIUS, p) * s;
@@ -1687,7 +1768,11 @@ impl Renderer {
         let icons = &self.icons;
         let ic_n = icons.n;
         let ic_half = ic_n as f32 / 2.0;
-        let play_mask: &[u8] = if self.media_is_playing { &icons.pause } else { &icons.play };
+        let play_mask: &[u8] = if self.media_is_playing {
+            &icons.pause
+        } else {
+            &icons.play
+        };
 
         // Collapsed audio visualizer (anchored inside the collapsed pill)
         let collapsed_fade = (1.0 - fade).clamp(0.0, 1.0);
@@ -1745,8 +1830,9 @@ impl Renderer {
                         if (fy - rg.cy).abs() >= ring_half_h {
                             continue;
                         }
-                        let (arc_cov, track_cov) =
-                            sample_progress_circle(fx, fy, cx_ring, rg.cy, r_ring, thickness, rg.pct);
+                        let (arc_cov, track_cov) = sample_progress_circle(
+                            fx, fy, cx_ring, rg.cy, r_ring, thickness, rg.pct,
+                        );
                         if track_cov > 0.0 || arc_cov > 0.0 {
                             let eff_track = track_cov * (1.0 - arc_cov) * fade;
                             let eff_arc = arc_cov * fade;
@@ -1756,7 +1842,9 @@ impl Renderer {
                         }
 
                         if x >= pct_x0 && x < pct_x0 + pct_box_w {
-                            let c = sample(rg.pct_mask, rg.pct_hw, rg.pct_hh, x - pct_x0, y, rg.pct_dy) * fade;
+                            let c =
+                                sample(rg.pct_mask, rg.pct_hw, rg.pct_hh, x - pct_x0, y, rg.pct_dy)
+                                    * fade;
                             if c > 0.0 {
                                 r += 245.0 * c;
                                 g += 245.0 * c;
@@ -1765,7 +1853,9 @@ impl Renderer {
                         }
 
                         if x >= lbl_x0 && x < lbl_x0 + lbl_box_w {
-                            let c = sample(rg.lbl_mask, rg.lbl_hw, rg.lbl_hh, x - lbl_x0, y, rg.lbl_dy) * fade;
+                            let c =
+                                sample(rg.lbl_mask, rg.lbl_hw, rg.lbl_hh, x - lbl_x0, y, rg.lbl_dy)
+                                    * fade;
                             if c > 0.0 {
                                 r += 155.0 * c;
                                 g += 160.0 * c;
@@ -1791,10 +1881,19 @@ impl Renderer {
 
                 // ---- Album art (collapsed: left of the clock, expanded: left column) ----
                 if in_art_y && fx > art_x - 1.5 && fx < art_x + art_sz + 1.5 {
-                    let art_cov = sdf_rounded_box_cov(fx, fy, art_cx, art_cy, art_sz / 2.0, art_sz / 2.0, art_r);
+                    let art_cov = sdf_rounded_box_cov(
+                        fx,
+                        fy,
+                        art_cx,
+                        art_cy,
+                        art_sz / 2.0,
+                        art_sz / 2.0,
+                        art_r,
+                    );
                     if art_cov > 0.0 {
                         if let Some(ref pix) = self.thumb_pixels {
-                            let (pr, pg, pb) = sample_thumb(pix, (fx - art_x) / art_sz, (fy - art_y) / art_sz);
+                            let (pr, pg, pb) =
+                                sample_thumb(pix, (fx - art_x) / art_sz, (fy - art_y) / art_sz);
                             r += pr * art_cov;
                             g += pg * art_cov;
                             b += pb * art_cov;
@@ -1815,7 +1914,7 @@ impl Renderer {
                     let br = bw / 2.0;
                     let gap = 6.6 * s;
                     let b1 = sample_eq_bar(fx, fy, viz_cx - gap, viz_cy, bw, eq_h1, br);
-                    let b2 = sample_eq_bar(fx, fy, viz_cx,       viz_cy, bw, eq_h2, br);
+                    let b2 = sample_eq_bar(fx, fy, viz_cx, viz_cy, bw, eq_h2, br);
                     let b3 = sample_eq_bar(fx, fy, viz_cx + gap, viz_cy, bw, eq_h3, br);
                     let tot = (b1 + b2 + b3).min(1.0) * collapsed_fade * viz_alpha;
                     if tot > 0.0 {
@@ -1828,7 +1927,14 @@ impl Renderer {
                 // ---- Title ----
                 if in_title_y && x >= title_x0 && x < title_x0 + media_text_w {
                     let lx = x - title_x0;
-                    let c = sample(&self.media_title_mask, self.media_title_hw, self.media_title_hh, lx, y, title_dy) * fade;
+                    let c = sample(
+                        &self.media_title_mask,
+                        self.media_title_hw,
+                        self.media_title_hh,
+                        lx,
+                        y,
+                        title_dy,
+                    ) * fade;
                     if c > 0.0 {
                         r += 245.0 * c;
                         g += 245.0 * c;
@@ -1838,10 +1944,26 @@ impl Renderer {
 
                 // ---- Slider ----
                 if in_slider_y && fx > sl_x0 - 7.0 * s && fx < sl_x1 + 7.0 * s {
-                    let track = sdf_rounded_box_cov(fx, fy, (sl_x0 + sl_x1) / 2.0, sl_y, (sl_x1 - sl_x0) / 2.0, sl_th, sl_th);
+                    let track = sdf_rounded_box_cov(
+                        fx,
+                        fy,
+                        (sl_x0 + sl_x1) / 2.0,
+                        sl_y,
+                        (sl_x1 - sl_x0) / 2.0,
+                        sl_th,
+                        sl_th,
+                    );
                     let fill_hw = (sl_px - sl_x0) / 2.0;
                     let filled = if fill_hw > 0.5 {
-                        sdf_rounded_box_cov(fx, fy, (sl_x0 + sl_px) / 2.0, sl_y, fill_hw, sl_th, sl_th)
+                        sdf_rounded_box_cov(
+                            fx,
+                            fy,
+                            (sl_x0 + sl_px) / 2.0,
+                            sl_y,
+                            fill_hw,
+                            sl_th,
+                            sl_th,
+                        )
                     } else {
                         0.0
                     };
@@ -1859,27 +1981,52 @@ impl Renderer {
                 // ---- Controls (SVG icon masks) ----
                 if in_btn_y && fx > cx_prev - ic_half - 1.0 && fx < cx_next + ic_half + 1.0 {
                     if hover_btn == 1 {
-                        let a = 0.18 * fade * sample_button_circle(fx, fy, cx_prev, btn_cy, BTN_SEC_R * s);
+                        let a = 0.18
+                            * fade
+                            * sample_button_circle(fx, fy, cx_prev, btn_cy, BTN_SEC_R * s);
                         r += 255.0 * a;
                         g += 255.0 * a;
                         b += 255.0 * a;
                     }
                     if hover_btn == 2 {
-                        let a = 0.18 * fade * sample_button_circle(fx, fy, cx_play, btn_cy, BTN_HIT_R * s);
+                        let a = 0.18
+                            * fade
+                            * sample_button_circle(fx, fy, cx_play, btn_cy, BTN_HIT_R * s);
                         r += 255.0 * a;
                         g += 255.0 * a;
                         b += 255.0 * a;
                     }
                     if hover_btn == 3 {
-                        let a = 0.18 * fade * sample_button_circle(fx, fy, cx_next, btn_cy, BTN_SEC_R * s);
+                        let a = 0.18
+                            * fade
+                            * sample_button_circle(fx, fy, cx_next, btn_cy, BTN_SEC_R * s);
                         r += 255.0 * a;
                         g += 255.0 * a;
                         b += 255.0 * a;
                     }
 
-                    let ic = sample_icon(&icons.prev, ic_n, cx_prev - ic_half, btn_cy - ic_half, fx, fy)
-                        + sample_icon(play_mask, ic_n, cx_play - ic_half, btn_cy - ic_half, fx, fy)
-                        + sample_icon(&icons.next, ic_n, cx_next - ic_half, btn_cy - ic_half, fx, fy);
+                    let ic = sample_icon(
+                        &icons.prev,
+                        ic_n,
+                        cx_prev - ic_half,
+                        btn_cy - ic_half,
+                        fx,
+                        fy,
+                    ) + sample_icon(
+                        play_mask,
+                        ic_n,
+                        cx_play - ic_half,
+                        btn_cy - ic_half,
+                        fx,
+                        fy,
+                    ) + sample_icon(
+                        &icons.next,
+                        ic_n,
+                        cx_next - ic_half,
+                        btn_cy - ic_half,
+                        fx,
+                        fy,
+                    );
                     let ic = ic.min(1.0) * fade;
                     if ic > 0.0 {
                         r += 255.0 * ic;
@@ -1990,7 +2137,16 @@ fn main() -> windows::core::Result<()> {
         let mut last_hover_btn = HOVER_BTN.load(Ordering::Relaxed);
 
         let mut r = Renderer::new(win_w, win_h, s);
-        r.draw(hwnd, 0.0, disp_cpu, disp_ram, &last_media_info, last_hover_btn, 0.0, 0.0); // layered windows show nothing until the first UpdateLayeredWindow
+        r.draw(
+            hwnd,
+            0.0,
+            disp_cpu,
+            disp_ram,
+            &last_media_info,
+            last_hover_btn,
+            0.0,
+            0.0,
+        ); // layered windows show nothing until the first UpdateLayeredWindow
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let mut freq = 0i64;
@@ -2099,13 +2255,21 @@ fn main() -> windows::core::Result<()> {
             }
             let drag_raw = DRAG_FRAC.load(Ordering::Relaxed);
             if drag_raw != 0 && media_info.duration_secs > 0.5 {
-                media_info.position_secs = (drag_raw - 1) as f32 / 1000.0 * media_info.duration_secs;
+                media_info.position_secs =
+                    (drag_raw - 1) as f32 / 1000.0 * media_info.duration_secs;
                 media_info.sampled_at = None;
             }
             let hover_btn = HOVER_BTN.load(Ordering::Relaxed);
-            MEDIA_ACTIVE.store(media_info.has_session && !media_info.title.is_empty(), Ordering::Relaxed);
+            MEDIA_ACTIVE.store(
+                media_info.has_session && !media_info.title.is_empty(),
+                Ordering::Relaxed,
+            );
 
-            let want_w = if media_info.has_session && !media_info.title.is_empty() { 1.0f32 } else { 0.0 };
+            let want_w = if media_info.has_session && !media_info.title.is_empty() {
+                1.0f32
+            } else {
+                0.0
+            };
             let mw_moving = (want_w - music_w).abs() > 1e-3;
             if mw_moving {
                 music_w += (want_w - music_w) * (dt * 14.0).min(1.0);
@@ -2125,9 +2289,11 @@ fn main() -> windows::core::Result<()> {
             last_hover_btn = hover_btn;
 
             let eq_animating = media_info.has_session && media_info.is_playing && pos < 0.95;
-            let animating = unsettled || (pos > 0.01 && metrics_moving) || eq_animating || mw_moving;
+            let animating =
+                unsettled || (pos > 0.01 && metrics_moving) || eq_animating || mw_moving;
             // Keep the slider ticking while expanded and playing (idle loop wakes every 200 ms).
-            let slider_live = (pos > 0.5 && media_info.has_session && media_info.is_playing) || drag_raw != 0;
+            let slider_live =
+                (pos > 0.5 && media_info.has_session && media_info.is_playing) || drag_raw != 0;
 
             // Clock text changes once a minute; check cheaply and redraw if needed.
             let t = GetLocalTime();
@@ -2170,7 +2336,10 @@ fn main() -> windows::core::Result<()> {
 
 /// Fixed window size (the expanded pill plus a 1 px margin) at scale `s`.
 fn window_size(s: f32) -> (i32, i32) {
-    ((EXPANDED_W * s).ceil() as i32 + 2, (EXPANDED_H * s).ceil() as i32 + 2)
+    (
+        (EXPANDED_W * s).ceil() as i32 + 2,
+        (EXPANDED_H * s).ceil() as i32 + 2,
+    )
 }
 
 /// Size the window for scale `s` and centre it at the top of the primary monitor.
@@ -2178,14 +2347,25 @@ unsafe fn place_window(hwnd: HWND, s: f32) {
     let (win_w, win_h) = window_size(s);
     let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
     let y = (TOP_MARGIN * s).round() as i32;
-    let _ = SetWindowPos(hwnd, None, x, y, win_w, win_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        x,
+        y,
+        win_w,
+        win_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
 }
 
 /// After a modal interaction (context menu): collapse if the cursor is no longer over the pill.
 unsafe fn collapse_if_cursor_away(hwnd: HWND) {
     TRACKING.store(false, Ordering::Relaxed);
     let mut pt = POINT::default();
-    if GetCursorPos(&mut pt).is_ok() && WindowFromPoint(pt) != hwnd && !PINNED.load(Ordering::Relaxed) {
+    if GetCursorPos(&mut pt).is_ok()
+        && WindowFromPoint(pt) != hwnd
+        && !PINNED.load(Ordering::Relaxed)
+    {
         TARGET_EXPANDED.store(false, Ordering::Relaxed);
         HOVER_BTN.store(0, Ordering::Relaxed);
     }
@@ -2245,7 +2425,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 PRESSED_BTN.store(HOVER_BTN.load(Ordering::Relaxed), Ordering::Relaxed);
                 if HOVER_BTN.load(Ordering::Relaxed) == 4 && MEDIA_ACTIVE.load(Ordering::Relaxed) {
                     DRAGGING.store(true, Ordering::Relaxed);
-                    DRAG_FRAC.store((slider_frac(lparam) * 1000.0).round() as u32 + 1, Ordering::Relaxed);
+                    DRAG_FRAC.store(
+                        (slider_frac(lparam) * 1000.0).round() as u32 + 1,
+                        Ordering::Relaxed,
+                    );
                     let _ = SetCapture(hwnd);
                 }
                 LRESULT(0)
@@ -2283,7 +2466,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     _ => {
                         let p = !PINNED.load(Ordering::Relaxed);
                         PINNED.store(p, Ordering::Relaxed);
-                        TARGET_EXPANDED.store(p || TRACKING.load(Ordering::Relaxed), Ordering::Relaxed);
+                        TARGET_EXPANDED
+                            .store(p || TRACKING.load(Ordering::Relaxed), Ordering::Relaxed);
                     }
                 }
                 LRESULT(0)
@@ -2352,12 +2536,21 @@ mod tests {
         // 50% progress: arc spans 12 o'clock clockwise to 6 o'clock (right half).
         // 3 o'clock point (70.0, 50.0) should have high arc coverage.
         let (arc_right, _) = sample_progress_circle(70.0, 50.0, 50.0, 50.0, 20.0, 4.0, 0.5);
-        assert!(arc_right > 0.5, "Right half at 3 o'clock should have high arc coverage");
+        assert!(
+            arc_right > 0.5,
+            "Right half at 3 o'clock should have high arc coverage"
+        );
 
         // 9 o'clock point (30.0, 50.0) is on the unreached half -> arc should be 0.0, track > 0.0.
         let (arc_left, track_left) = sample_progress_circle(30.0, 50.0, 50.0, 50.0, 20.0, 4.0, 0.5);
-        assert_eq!(arc_left, 0.0, "Left half at 9 o'clock should have 0 arc coverage");
-        assert!(track_left > 0.5, "Left half at 9 o'clock should have track coverage");
+        assert_eq!(
+            arc_left, 0.0,
+            "Left half at 9 o'clock should have 0 arc coverage"
+        );
+        assert!(
+            track_left > 0.5,
+            "Left half at 9 o'clock should have track coverage"
+        );
     }
 
     #[test]
@@ -2430,7 +2623,10 @@ mod tests {
         let a = Some(Arc::new(vec![1u8]));
         let b = Some(Arc::new(vec![1u8]));
         assert!(!thumb_changed(&a, &a.clone()));
-        assert!(thumb_changed(&a, &b), "different allocations count as changed");
+        assert!(
+            thumb_changed(&a, &b),
+            "different allocations count as changed"
+        );
         assert!(thumb_changed(&a, &None));
         assert!(!thumb_changed(&None, &None));
     }
@@ -2467,7 +2663,11 @@ mod tests {
         assert_eq!(hit_test(CX_PLAY, CY_BTN, true), 2);
         assert_eq!(hit_test(CX_NEXT, CY_BTN, true), 3);
         assert_eq!(hit_test((SLIDER_X0 + SLIDER_X1) / 2.0, SLIDER_Y, true), 4);
-        assert_eq!(hit_test(CX_PLAY, CY_BTN, false), 0, "no controls without a media session");
+        assert_eq!(
+            hit_test(CX_PLAY, CY_BTN, false),
+            0,
+            "no controls without a media session"
+        );
         assert_eq!(hit_test(0.0, 0.0, true), 0);
     }
 
