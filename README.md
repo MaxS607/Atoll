@@ -43,34 +43,6 @@ cargo build --release
 
 The executable is at `target/release/atoll.exe`. Run it to start the island. It has no console window and no tray icon, so quit it by right-clicking the island.
 
-### Cargo dependencies
-
-Atoll uses the `windows` crate. Your `Cargo.toml` needs these features:
-
-```toml
-[dependencies.windows]
-version = "0.58"
-features = [
-    "Foundation",
-    "Foundation_Collections",
-    "Graphics_Imaging",
-    "Media_Control",
-    "Storage_Streams",
-    "Win32_Foundation",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Gdi",
-    "Win32_System_Com",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Performance",
-    "Win32_System_SystemInformation",
-    "Win32_System_Threading",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_WindowsAndMessaging",
-]
-```
-
-Adjust the version to match the one your project already uses.
 
 ## Controls
 
