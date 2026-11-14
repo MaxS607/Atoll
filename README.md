@@ -72,6 +72,7 @@ Colours for the CPU and RAM rings are set in `get_cpu_color` and `get_ram_color`
 
 ## Notes and limitations
 
-- The window is placed on the primary monitor, centred at the top.
+- The window is placed on the primary monitor, centred at the top, and re-centred when the display configuration changes.
+- Only one instance runs at a time; starting a second one exits immediately.
 - The media controls only appear while a media session exists.
 - The weekday names are currently in German.

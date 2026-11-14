@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::core::w;
+use windows::Foundation::{AsyncStatus, IAsyncOperation};
 use windows::Graphics::Imaging::{
     BitmapAlphaMode, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat, BitmapTransform,
     ColorManagementMode, ExifOrientationMode,
@@ -32,7 +33,8 @@ use windows::Media::Control::{
 };
 use windows::Storage::Streams::IRandomAccessStreamReference;
 use windows::Win32::Foundation::{
-    COLORREF, FILETIME, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    GetLastError, BOOL, COLORREF, ERROR_ALREADY_EXISTS, FILETIME, HANDLE, HWND, LPARAM, LRESULT,
+    POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
@@ -40,7 +42,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::{GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX};
-use windows::Win32::System::Threading::{GetSystemTimes, Sleep};
+use windows::Win32::System::Threading::{CreateMutexW, GetSystemTimes, Sleep};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, ReleaseCapture, SetCapture, TrackMouseEvent, KEYEVENTF_KEYUP, TME_LEAVE,
@@ -113,17 +115,19 @@ const CX_PLAY: f32 = 155.0;
 const CX_NEXT: f32 = 179.0;
 const CY_BTN: f32  = 76.0;
 
-const CMD_NONE: u8 = 0;
 const CMD_TOGGLE: u8 = 1;
 const CMD_NEXT: u8 = 2;
 const CMD_PREV: u8 = 3;
 
-static MEDIA_CMD: AtomicU8 = AtomicU8::new(CMD_NONE);
+// Queue of pending media commands, so quick successive clicks are not coalesced into one.
+static MEDIA_CMDS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static MEDIA_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MEDIA_SEEK: AtomicU32 = AtomicU32::new(0); // 0 = none, else permille + 1
 static DRAGGING: AtomicBool = AtomicBool::new(false); // seek slider is being dragged
 static DRAG_FRAC: AtomicU32 = AtomicU32::new(0); // slider position shown while dragging, permille + 1
 static HOVER_BTN: AtomicU8 = AtomicU8::new(0);
+const NO_PRESS: u8 = 255;
+static PRESSED_BTN: AtomicU8 = AtomicU8::new(NO_PRESS); // button that received WM_LBUTTONDOWN
 
 const VK_MEDIA_NEXT_TRACK: VIRTUAL_KEY = VIRTUAL_KEY(0xB0);
 const VK_MEDIA_PREV_TRACK: VIRTUAL_KEY = VIRTUAL_KEY(0xB1);
@@ -134,6 +138,24 @@ fn slider_frac(lparam: LPARAM) -> f32 {
     let s = unsafe { GetDpiForSystem() } as f32 / 96.0;
     let mx = (lparam.0 & 0xFFFF) as i16 as f32 / s;
     ((mx - SLIDER_X0) / (SLIDER_X1 - SLIDER_X0)).clamp(0.0, 1.0)
+}
+
+fn push_media_cmd(cmd: u8) {
+    if let Ok(mut q) = MEDIA_CMDS.lock() {
+        if q.len() < 16 {
+            q.push(cmd);
+        }
+    }
+}
+
+/// Used when no media session can be controlled directly: send the global media key instead.
+fn send_fallback_key(cmd: u8) {
+    match cmd {
+        CMD_TOGGLE => send_media_key(VK_MEDIA_PLAY_PAUSE),
+        CMD_NEXT => send_media_key(VK_MEDIA_NEXT_TRACK),
+        CMD_PREV => send_media_key(VK_MEDIA_PREV_TRACK),
+        _ => {}
+    }
 }
 
 fn send_media_key(vk: VIRTUAL_KEY) {
@@ -150,7 +172,7 @@ struct MediaInfo {
     artist: String,
     is_playing: bool,
     has_session: bool,
-    thumbnail: Option<Vec<u8>>,
+    thumbnail: Option<Arc<Vec<u8>>>, // shared, so cloning MediaInfo every frame stays cheap
     thumb_w: u32,
     thumb_h: u32,
     position_secs: f32,
@@ -167,20 +189,57 @@ fn now_filetime() -> i64 {
         + 116_444_736_000_000_000
 }
 
+/// Edge length of the decoded (square) album-art texture.
+const THUMB_SIZE: u32 = 96;
+/// Give up on a WinRT async call after this long, so one hung media app cannot stall the thread.
+const ASYNC_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often to retry decoding a track's thumbnail while it is still missing.
+const MAX_THUMB_TRIES: u32 = 10;
+
+/// Wait for a WinRT async operation with a timeout (cancelling it when the time is up).
+fn wait_timeout<T: windows::core::RuntimeType + 'static>(
+    op: &IAsyncOperation<T>,
+    timeout: Duration,
+) -> Option<T> {
+    let start = Instant::now();
+    while op.Status().ok()? == AsyncStatus::Started {
+        if start.elapsed() >= timeout {
+            let _ = op.Cancel();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    op.GetResults().ok()
+}
+
+/// True when two thumbnails are not the same shared texture.
+fn thumb_changed(a: &Option<Arc<Vec<u8>>>, b: &Option<Arc<Vec<u8>>>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => !Arc::ptr_eq(x, y),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 fn decode_thumbnail(thumb_ref: &IRandomAccessStreamReference, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let stream = thumb_ref.OpenReadAsync().ok()?.get().ok()?;
-    let decoder = BitmapDecoder::CreateAsync(&stream).ok()?.get().ok()?;
+    let stream = wait_timeout(&thumb_ref.OpenReadAsync().ok()?, ASYNC_TIMEOUT)?;
+    let decoder = wait_timeout(&BitmapDecoder::CreateAsync(&stream).ok()?, ASYNC_TIMEOUT)?;
     let transform = BitmapTransform::new().ok()?;
     transform.SetScaledWidth(size).ok()?;
     transform.SetScaledHeight(size).ok()?;
     transform.SetInterpolationMode(BitmapInterpolationMode::Linear).ok()?;
-    let pixel_data = decoder.GetPixelDataTransformedAsync(
-        BitmapPixelFormat::Bgra8,
-        BitmapAlphaMode::Premultiplied,
-        &transform,
-        ExifOrientationMode::RespectExifOrientation,
-        ColorManagementMode::ColorManageToSRgb,
-    ).ok()?.get().ok()?;
+    let pixel_data = wait_timeout(
+        &decoder
+            .GetPixelDataTransformedAsync(
+                BitmapPixelFormat::Bgra8,
+                BitmapAlphaMode::Premultiplied,
+                &transform,
+                ExifOrientationMode::RespectExifOrientation,
+                ColorManagementMode::ColorManageToSRgb,
+            )
+            .ok()?,
+        ASYNC_TIMEOUT,
+    )?;
     let data = pixel_data.DetachPixelData().ok()?;
     Some((size, size, data.to_vec()))
 }
@@ -204,7 +263,8 @@ impl MediaController {
             let mut last_artist = String::new();
             let mut last_playing = false;
             let mut last_has_session = false;
-            let mut last_thumb: Option<Vec<u8>> = None;
+            let mut last_thumb: Option<Arc<Vec<u8>>> = None;
+            let mut thumb_tries = 0u32;
             let mut last_thumb_w = 0u32;
             let mut last_thumb_h = 0u32;
 
@@ -212,25 +272,30 @@ impl MediaController {
                 if manager.is_none() {
                     manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
                         .ok()
-                        .and_then(|op| op.get().ok());
+                        .and_then(|op| wait_timeout(&op, ASYNC_TIMEOUT));
                 }
 
-                let cmd = MEDIA_CMD.swap(CMD_NONE, Ordering::Relaxed);
+                let cmds: Vec<u8> = MEDIA_CMDS
+                    .lock()
+                    .map(|mut q| std::mem::take(&mut *q))
+                    .unwrap_or_default();
                 let seek = MEDIA_SEEK.swap(0, Ordering::Relaxed);
 
                 if let Some(ref mgr) = manager {
                     if let Ok(session) = mgr.GetCurrentSession() {
-                        match cmd {
-                            CMD_TOGGLE => {
-                                let _ = session.TryTogglePlayPauseAsync();
+                        for &cmd in &cmds {
+                            match cmd {
+                                CMD_TOGGLE => {
+                                    let _ = session.TryTogglePlayPauseAsync();
+                                }
+                                CMD_NEXT => {
+                                    let _ = session.TrySkipNextAsync();
+                                }
+                                CMD_PREV => {
+                                    let _ = session.TrySkipPreviousAsync();
+                                }
+                                _ => {}
                             }
-                            CMD_NEXT => {
-                                let _ = session.TrySkipNextAsync();
-                            }
-                            CMD_PREV => {
-                                let _ = session.TrySkipPreviousAsync();
-                            }
-                            _ => {}
                         }
 
                         // Timeline (all values are 100 ns ticks)
@@ -263,7 +328,7 @@ impl MediaController {
                         let (title, artist, thumb_opt) = session
                             .TryGetMediaPropertiesAsync()
                             .ok()
-                            .and_then(|op| op.get().ok())
+                            .and_then(|op| wait_timeout(&op, ASYNC_TIMEOUT))
                             .map(|props| {
                                 let t = props.Title().map(|s| s.to_string_lossy()).unwrap_or_default();
                                 let a = props.Artist().map(|s| s.to_string_lossy()).unwrap_or_default();
@@ -274,20 +339,23 @@ impl MediaController {
 
                         let is_new_track = title != last_title || artist != last_artist;
                         if is_new_track {
+                            last_thumb = None;
+                            last_thumb_w = 0;
+                            last_thumb_h = 0;
+                            thumb_tries = 0;
+                        }
+                        // Players often publish the title before the artwork, so keep retrying
+                        // (a limited number of times) until a thumbnail decodes.
+                        let mut thumb_changed_now = false;
+                        if last_thumb.is_none() && thumb_tries < MAX_THUMB_TRIES {
                             if let Some(ref t_ref) = thumb_opt {
-                                if let Some((tw, th, data)) = decode_thumbnail(t_ref, 96) {
-                                    last_thumb = Some(data);
+                                thumb_tries += 1;
+                                if let Some((tw, th, data)) = decode_thumbnail(t_ref, THUMB_SIZE) {
+                                    last_thumb = Some(Arc::new(data));
                                     last_thumb_w = tw;
                                     last_thumb_h = th;
-                                } else {
-                                    last_thumb = None;
-                                    last_thumb_w = 0;
-                                    last_thumb_h = 0;
+                                    thumb_changed_now = true;
                                 }
-                            } else {
-                                last_thumb = None;
-                                last_thumb_w = 0;
-                                last_thumb_h = 0;
                             }
                         }
 
@@ -304,7 +372,7 @@ impl MediaController {
                             position_secs = position_secs.min(duration_secs);
                         }
 
-                        if is_new_track || is_playing != last_playing || !last_has_session {
+                        if is_new_track || thumb_changed_now || is_playing != last_playing || !last_has_session {
                             last_title = title.clone();
                             last_artist = artist.clone();
                             last_playing = is_playing;
@@ -331,11 +399,8 @@ impl MediaController {
                         }
                     } else {
                         // Fallback media keys if no active session
-                        match cmd {
-                            CMD_TOGGLE => send_media_key(VK_MEDIA_PLAY_PAUSE),
-                            CMD_NEXT => send_media_key(VK_MEDIA_NEXT_TRACK),
-                            CMD_PREV => send_media_key(VK_MEDIA_PREV_TRACK),
-                            _ => {}
+                        for &cmd in &cmds {
+                            send_fallback_key(cmd);
                         }
 
                         if last_has_session {
@@ -344,6 +409,7 @@ impl MediaController {
                             last_artist.clear();
                             last_playing = false;
                             last_thumb = None;
+                            thumb_tries = 0;
 
                             if let Ok(mut lock) = info_clone.lock() {
                                 *lock = MediaInfo::default();
@@ -351,11 +417,8 @@ impl MediaController {
                         }
                     }
                 } else {
-                    match cmd {
-                        CMD_TOGGLE => send_media_key(VK_MEDIA_PLAY_PAUSE),
-                        CMD_NEXT => send_media_key(VK_MEDIA_NEXT_TRACK),
-                        CMD_PREV => send_media_key(VK_MEDIA_PREV_TRACK),
-                        _ => {}
+                    for &cmd in &cmds {
+                        send_fallback_key(cmd);
                     }
                 }
 
@@ -566,16 +629,6 @@ fn sample_eq_bar(fx: f32, fy: f32, bx: f32, by: f32, bw: f32, bh: f32, r: f32) -
 }
 
 // ---- Vector icon SDFs ------------------------------------------------------
-
-/// Signed distance to a line segment from point p to segment (a→b).
-#[allow(dead_code)]
-fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let (dpx, dpy) = (px - ax, py - ay);
-    let (dbx, dby) = (bx - ax, by - ay);
-    let t = ((dpx * dbx + dpy * dby) / (dbx * dbx + dby * dby)).clamp(0.0, 1.0);
-    let (ex, ey) = (dpx - t * dbx, dpy - t * dby);
-    ex.hypot(ey)
-}
 
 /// AA coverage for a filled circle (positive inside).
 fn sdf_circle_cov(fx: f32, fy: f32, cx: f32, cy: f32, r: f32) -> f32 {
@@ -886,9 +939,9 @@ impl IconSet {
     }
 }
 
-/// Bilinear sample of the 96x96 BGRA album-art texture at normalised (u, v). Returns (r, g, b).
+/// Bilinear sample of the THUMB_SIZE x THUMB_SIZE BGRA album-art texture at normalised (u, v). Returns (r, g, b).
 fn sample_thumb(pix: &[u8], u: f32, v: f32) -> (f32, f32, f32) {
-    const N: usize = 96;
+    const N: usize = THUMB_SIZE as usize;
     if pix.len() < N * N * 4 {
         return (0.0, 0.0, 0.0);
     }
@@ -953,8 +1006,12 @@ unsafe fn render_mask_ex(
     let dc = CreateCompatibleDC(screen);
     let bmi = make_bmi(hw, hh);
     let mut bits: *mut c_void = std::ptr::null_mut();
-    let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0)
-        .expect("CreateDIBSection (mask)");
+    let Ok(bmp) = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) else {
+        // GDI is out of resources: draw nothing rather than crash the whole island.
+        let _ = DeleteDC(dc);
+        ReleaseDC(None, screen);
+        return vec![0u8; (hw * hh).max(0) as usize];
+    };
     let old_bmp = SelectObject(dc, bmp);
 
     let font = CreateFontW(
@@ -1057,9 +1114,8 @@ struct Renderer {
     media_title_hw: i32,
     media_title_hh: i32,
 
-    // Album art (decoded BGRA premul, 96×96)
-    thumb_pixels: Option<Vec<u8>>,
-    thumb_title: String, // track that produced thumb_pixels
+    // Album art (decoded BGRA premul, THUMB_SIZE x THUMB_SIZE), shared with the media thread
+    thumb_pixels: Option<Arc<Vec<u8>>>,
 
     icons: IconSet,
 }
@@ -1139,7 +1195,6 @@ impl Renderer {
             media_title_hh: title_hh,
 
             thumb_pixels: None,
-            thumb_title: String::new(),
 
             icons: IconSet::new(s),
         };
@@ -1288,15 +1343,9 @@ impl Renderer {
             self.update_media(&media.title, media.is_playing);
         }
 
-        // Sync album art from MediaInfo (only clone pixels once per track)
-        if has_media {
-            if media.title != self.thumb_title {
-                self.thumb_title = media.title.clone();
-                self.thumb_pixels = media.thumbnail.clone();
-            }
-        } else if !media.has_session {
-            self.thumb_pixels = None;
-            self.thumb_title.clear();
+        // Sync album art from MediaInfo (a cheap Arc clone, only when the texture changed)
+        if (has_media || !media.has_session) && thumb_changed(&self.thumb_pixels, &media.thumbnail) {
+            self.thumb_pixels = media.thumbnail.clone();
         }
 
         // Playback progress for the slider
@@ -1649,6 +1698,12 @@ fn main() -> windows::core::Result<()> {
         let _ = SetProcessDPIAware();
         let s = GetDpiForSystem() as f32 / 96.0;
 
+        // Only one island at a time: a second launch exits immediately.
+        let _instance = CreateMutexW(None, BOOL(0), w!("Local\\AtollSingleInstance"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            return Ok(());
+        }
+
         let hinstance = GetModuleHandleW(None)?;
         let class_name = w!("AtollClass");
         let wc = WNDCLASSW {
@@ -1809,6 +1864,7 @@ fn main() -> windows::core::Result<()> {
                 || media_info.artist != last_media_info.artist
                 || media_info.is_playing != last_media_info.is_playing
                 || media_info.has_session != last_media_info.has_session
+                || thumb_changed(&media_info.thumbnail, &last_media_info.thumbnail)
                 || hover_btn != last_hover_btn;
 
             last_media_info = media_info.clone();
@@ -1849,6 +1905,15 @@ fn main() -> windows::core::Result<()> {
             }
         }
     }
+}
+
+/// Centre the (fixed-size) window at the top of the primary monitor.
+unsafe fn reposition(hwnd: HWND) {
+    let s = GetDpiForSystem() as f32 / 96.0;
+    let win_w = (EXPANDED_W * s).ceil() as i32 + 2;
+    let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
+    let y = (TOP_MARGIN * s).round() as i32;
+    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1904,7 +1969,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            WM_DISPLAYCHANGE => {
+                // Resolution or monitor layout changed: keep the island centred.
+                reposition(hwnd);
+                LRESULT(0)
+            }
             WM_LBUTTONDOWN => {
+                PRESSED_BTN.store(HOVER_BTN.load(Ordering::Relaxed), Ordering::Relaxed);
                 if HOVER_BTN.load(Ordering::Relaxed) == 4 && MEDIA_ACTIVE.load(Ordering::Relaxed) {
                     DRAGGING.store(true, Ordering::Relaxed);
                     DRAG_FRAC.store((slider_frac(lparam) * 1000.0).round() as u32 + 1, Ordering::Relaxed);
@@ -1915,6 +1986,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_LBUTTONUP => {
                 if DRAGGING.swap(false, Ordering::Relaxed) {
                     let _ = ReleaseCapture();
+                    PRESSED_BTN.store(NO_PRESS, Ordering::Relaxed);
                     let pm = (slider_frac(lparam) * 1000.0).round() as u32 + 1;
                     MEDIA_SEEK.store(pm, Ordering::Relaxed);
                     DRAG_FRAC.store(pm, Ordering::Relaxed);
@@ -1930,22 +2002,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     return LRESULT(0);
                 }
                 let btn = HOVER_BTN.load(Ordering::Relaxed);
+                // A click needs both press and release on the same target; releasing over the
+                // island after pressing elsewhere (e.g. dropping a drag) is ignored.
+                if PRESSED_BTN.swap(NO_PRESS, Ordering::Relaxed) != btn {
+                    return LRESULT(0);
+                }
                 match btn {
-                    1 => {
-                        MEDIA_CMD.store(CMD_PREV, Ordering::Relaxed);
-                    }
-                    2 => {
-                        MEDIA_CMD.store(CMD_TOGGLE, Ordering::Relaxed);
-                    }
-                    3 => {
-                        MEDIA_CMD.store(CMD_NEXT, Ordering::Relaxed);
-                    }
-                    4 => {
-                        let s = GetDpiForSystem() as f32 / 96.0;
-                        let mx = (lparam.0 & 0xFFFF) as i16 as f32 / s;
-                        let frac = ((mx - SLIDER_X0) / (SLIDER_X1 - SLIDER_X0)).clamp(0.0, 1.0);
-                        MEDIA_SEEK.store((frac * 1000.0).round() as u32 + 1, Ordering::Relaxed);
-                    }
+                    1 => push_media_cmd(CMD_PREV),
+                    2 => push_media_cmd(CMD_TOGGLE),
+                    3 => push_media_cmd(CMD_NEXT),
+                    4 => {} // slider clicks are handled as drags (WM_LBUTTONDOWN starts the drag)
                     _ => {
                         let p = !PINNED.load(Ordering::Relaxed);
                         PINNED.store(p, Ordering::Relaxed);
@@ -1971,46 +2037,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_imaging_types() {
-        use windows::Storage::Streams::IRandomAccessStreamReference;
-        let _ = std::mem::size_of::<Option<IRandomAccessStreamReference>>();
-        let _decode_check = |thumb_ref: &IRandomAccessStreamReference| -> Option<(u32, u32, Vec<u8>)> {
-            let stream = thumb_ref.OpenReadAsync().ok()?.get().ok()?;
-            let decoder = BitmapDecoder::CreateAsync(&stream).ok()?.get().ok()?;
-            let transform = BitmapTransform::new().ok()?;
-            transform.SetScaledWidth(64).ok()?;
-            transform.SetScaledHeight(64).ok()?;
-            transform.SetInterpolationMode(BitmapInterpolationMode::Linear).ok()?;
-            let pixel_data = decoder.GetPixelDataTransformedAsync(
-                BitmapPixelFormat::Bgra8,
-                BitmapAlphaMode::Premultiplied,
-                &transform,
-                ExifOrientationMode::RespectExifOrientation,
-                ColorManagementMode::ColorManageToSRgb,
-            ).ok()?.get().ok()?;
-            let data = pixel_data.DetachPixelData().ok()?;
-            Some((64, 64, data.to_vec()))
-        };
-    }
-
-    #[test]
-    fn test_media_icon_rendering() {
-        unsafe {
-            let m1 = render_mask("\u{25B6}", 16, 600, 64, 64);
-            let m2 = render_mask("\u{23F8}", 16, 600, 64, 64);
-            let m3 = render_mask("\u{23EE}", 16, 600, 64, 64);
-            let m4 = render_mask("\u{23ED}", 16, 600, 64, 64);
-            assert!(!m1.is_empty());
-            assert!(!m2.is_empty());
-            assert!(!m3.is_empty());
-            assert!(!m4.is_empty());
-            // Check that at least some pixels have non-zero alpha coverage
-            assert!(m1.iter().any(|&p| p > 0), "Play icon should render pixels");
-            assert!(m2.iter().any(|&p| p > 0), "Pause icon should render pixels");
-        }
-    }
 
     #[test]
     fn test_progress_circle_full_and_empty() {
@@ -2066,5 +2092,71 @@ mod tests {
         let bar_out = sample_eq_bar(80.0, 80.0, 50.0, 50.0, 4.0, 10.0, 1.0);
         assert!(bar_in > 0.5);
         assert_eq!(bar_out, 0.0);
+    }
+
+    #[test]
+    fn test_svg_path_absolute_square() {
+        let polys = parse_svg_path("M0 0 L10 0 L10 10 L0 10 Z");
+        assert_eq!(polys.len(), 1);
+        assert_eq!(polys[0].len(), 4);
+        assert_ne!(winding(&polys, 5.0, 5.0), 0);
+        assert_eq!(winding(&polys, 15.0, 5.0), 0);
+    }
+
+    #[test]
+    fn test_svg_path_relative_triangle() {
+        let polys = parse_svg_path("m0 0 l10 0 l0 10 z");
+        assert_eq!(polys.len(), 1);
+        assert_ne!(winding(&polys, 7.0, 2.0), 0);
+        assert_eq!(winding(&polys, 2.0, 7.0), 0);
+    }
+
+    #[test]
+    fn test_rounded_rect_path_and_raster() {
+        let d = rounded_rect(4.0, 4.0, 20.0, 20.0, 1.5);
+        let polys = parse_svg_path(&d);
+        assert_ne!(winding(&polys, 12.0, 12.0), 0);
+        assert_eq!(winding(&polys, 1.0, 1.0), 0);
+
+        let mask = rasterize_icon(&d, 24, 24.0);
+        assert_eq!(mask.len(), 24 * 24);
+        assert_eq!(mask[12 * 24 + 12], 255, "centre should be fully covered");
+        assert_eq!(mask[0], 0, "corner outside the shape should be empty");
+    }
+
+    #[test]
+    fn test_sample_thumb() {
+        let n = THUMB_SIZE as usize;
+        // BGRA = (10, 20, 30, 255) everywhere -> (r, g, b) = (30, 20, 10)
+        let pix: Vec<u8> = (0..n * n).flat_map(|_| [10u8, 20, 30, 255]).collect();
+        assert_eq!(sample_thumb(&pix, 0.5, 0.5), (30.0, 20.0, 10.0));
+        assert_eq!(sample_thumb(&pix, 0.0, 1.0), (30.0, 20.0, 10.0));
+        // Too-short buffers must not panic.
+        assert_eq!(sample_thumb(&[0u8; 4], 0.5, 0.5), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_thumb_changed() {
+        let a = Some(Arc::new(vec![1u8]));
+        let b = Some(Arc::new(vec![1u8]));
+        assert!(!thumb_changed(&a, &a.clone()));
+        assert!(thumb_changed(&a, &b), "different allocations count as changed");
+        assert!(thumb_changed(&a, &None));
+        assert!(!thumb_changed(&None, &None));
+    }
+
+    #[test]
+    fn test_now_filetime_is_plausible() {
+        // 2020-01-01 is about 1.3217e17 in FILETIME ticks.
+        assert!(now_filetime() > 132_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_media_cmd_queue_keeps_every_click() {
+        MEDIA_CMDS.lock().unwrap().clear();
+        push_media_cmd(CMD_NEXT);
+        push_media_cmd(CMD_NEXT);
+        let drained = std::mem::take(&mut *MEDIA_CMDS.lock().unwrap());
+        assert_eq!(drained, vec![CMD_NEXT, CMD_NEXT]);
     }
 }
