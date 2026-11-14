@@ -1,10 +1,6 @@
 # Atoll
 A smooth, tiny "interactive pill notch" for Windows. Atoll sits at the top centre of your screen as a small pill showing the time. Hover over it and it expands into a dashboard with media controls, CPU and RAM meters, and the date.
 
-<img width="316" height="103" alt="image1" src="https://github.com/user-attachments/assets/f2ec0763-94ab-4649-bef7-64b09fbaa21f" />
-<br>
-<img width="642" height="229" alt="image2" src="https://github.com/user-attachments/assets/0e384afc-6d2c-4346-84e7-a47774f93178" />
-
 ## Features
 
 - **Collapsed:** a compact pill with the current time.
