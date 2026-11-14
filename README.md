@@ -9,15 +9,15 @@ A smooth, tiny "interactive pill notch" for Windows. Atoll sits at the top centr
 
 - **Collapsed:** a compact pill with the current time.
 - **Expanded (on hover):**
-  - Clock and date (weekday abbreviations, e.g. `Sa. 14.11.2026`)
+  - Clock and date (weekday abbreviation plus the short date in your regional format)
   - CPU and RAM usage as colour-coded rings (they shift colour as load rises)
   - Now-playing info: album cover, title, seek slider, previous / play-pause / next
 - **While music is playing:** the collapsed pill widens slightly to show the album cover on the left and an animated audio visualizer on the right.
 - **Seeking:** click or drag the slider to jump to any point in the track.
 - **Pinning:** left-click the island (outside the buttons) to keep it expanded; click again to release.
-- **Quit:** right-click the island.
+- **Quit:** right-click the island and choose *Quit Atoll*.
 
-Media info comes from the Windows media session (the same source as the system volume flyout), so it works with Spotify, browsers, and most players.
+Media info is event-driven (no constant polling) and comes from the Windows media session (the same source as the system volume flyout), so it works with Spotify, browsers, and most players.
 
 ## How it works
 
@@ -41,7 +41,7 @@ Atoll is a single Rust file with no UI framework.
 cargo build --release
 ```
 
-The executable is at `target/release/atoll.exe`. Run it to start the island. It has no console window and no tray icon, so quit it by right-clicking the island.
+The executable is at `target/release/atoll.exe`. Run it to start the island. It has no console window and no tray icon, so quit it from the right-click menu on the island.
 
 
 ## Controls
@@ -53,7 +53,7 @@ The executable is at `target/release/atoll.exe`. Run it to start the island. It 
 | Left-click the pill | Pin or unpin the expanded state |
 | Click prev / play-pause / next | Control the current media session |
 | Click or drag the slider | Seek within the track |
-| Right-click | Quit |
+| Right-click | Open the menu (Quit Atoll) |
 
 ## Customising
 
@@ -68,11 +68,11 @@ All layout values are constants at the top of `src/main.rs`, in logical pixels a
 | `SLIDER_*`, `CX_*`, `CY_BTN`, `ICON_BOX` | Slider, button positions and icon size |
 | `OMEGA` | Animation speed (higher is snappier, about 20 settles in 0.3 s) |
 
-Colours for the CPU and RAM rings are set in `get_cpu_color` and `get_ram_color`. The date format and the German weekday names are in `Renderer::update_text`.
+Colours for the CPU and RAM rings are set in `get_cpu_color` and `get_ram_color`. The time and date follow your Windows regional settings (see `locale_strings`).
 
 ## Notes and limitations
 
 - The window is placed on the primary monitor, centred at the top, and re-centred when the display configuration changes.
 - Only one instance runs at a time; starting a second one exits immediately.
 - The media controls only appear while a media session exists.
-- The weekday names are currently in German.
+- The clock uses your regional time format without seconds; in 12-hour locales the AM/PM marker is hidden to keep the pill compact.

@@ -17,24 +17,30 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::core::w;
-use windows::Foundation::{AsyncStatus, IAsyncOperation};
+use windows::core::{w, PCWSTR};
+use windows::Foundation::{AsyncStatus, EventRegistrationToken, IAsyncOperation, TypedEventHandler};
 use windows::Graphics::Imaging::{
-    BitmapAlphaMode, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat, BitmapTransform,
+    BitmapAlphaMode, BitmapBounds, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat, BitmapTransform,
     ColorManagementMode, ExifOrientationMode,
 };
 use windows::Media::Control::{
+    CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSession,
     GlobalSystemMediaTransportControlsSessionManager,
-    GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus, MediaPropertiesChangedEventArgs,
+    PlaybackInfoChangedEventArgs, TimelinePropertiesChangedEventArgs,
 };
 use windows::Storage::Streams::IRandomAccessStreamReference;
 use windows::Win32::Foundation::{
     GetLastError, BOOL, COLORREF, ERROR_ALREADY_EXISTS, FILETIME, HANDLE, HWND, LPARAM, LRESULT,
-    POINT, RECT, SIZE, WPARAM,
+    POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
+};
+use windows::Win32::Globalization::{
+    GetDateFormatEx, GetTimeFormatEx, DATE_SHORTDATE, ENUM_DATE_FORMATS_FLAGS, TIME_NOSECONDS,
+    TIME_NOTIMEMARKER,
 };
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
@@ -43,10 +49,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::{GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{CreateMutexW, GetSystemTimes, Sleep};
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, ReleaseCapture, SetCapture, TrackMouseEvent, KEYEVENTF_KEYUP, TME_LEAVE,
-    TRACKMOUSEEVENT, VIRTUAL_KEY,
+    ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -115,6 +124,18 @@ const CX_PLAY: f32 = 155.0;
 const CX_NEXT: f32 = 179.0;
 const CY_BTN: f32  = 76.0;
 
+// Hit-testing / drawing bands (logical px)
+const SLIDER_HIT_HALF_H: f32 = 8.0; // vertical hit zone around the slider
+const SLIDER_HIT_PAD: f32    = 4.0; // horizontal slack at both slider ends
+const SLIDER_BAND: f32       = 9.0; // rows scanned around the slider when drawing
+const VIZ_BAND: f32          = 14.0; // rows scanned around the collapsed visualizer
+const KNOB_R: f32            = 4.5;
+const KNOB_R_HOVER: f32      = 5.5;
+const MEDIA_TITLE_FONT: f32  = 12.5;
+const STALE_TIMELINE_SECS: f64 = 6.0 * 3600.0; // ignore timeline updates older than this
+const REFRESH_INTERVAL: Duration = Duration::from_millis(1000); // safety refresh of media state
+const ID_QUIT: usize = 1;
+
 const CMD_TOGGLE: u8 = 1;
 const CMD_NEXT: u8 = 2;
 const CMD_PREV: u8 = 3;
@@ -128,6 +149,25 @@ static DRAG_FRAC: AtomicU32 = AtomicU32::new(0); // slider position shown while 
 static HOVER_BTN: AtomicU8 = AtomicU8::new(0);
 const NO_PRESS: u8 = 255;
 static PRESSED_BTN: AtomicU8 = AtomicU8::new(NO_PRESS); // button that received WM_LBUTTONDOWN
+static SCALE_BITS: AtomicU32 = AtomicU32::new(0x3F80_0000); // f32 1.0: DPI scale of the window
+static RESCALE: AtomicBool = AtomicBool::new(false); // set by WM_DPICHANGED
+// Wakes the media thread when something happened (event, command, seek).
+static WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+fn scale() -> f32 {
+    f32::from_bits(SCALE_BITS.load(Ordering::Relaxed))
+}
+
+fn set_scale(s: f32) {
+    SCALE_BITS.store(s.to_bits(), Ordering::Relaxed);
+}
+
+fn wake_media_thread() {
+    if let Ok(mut dirty) = WAKE.0.lock() {
+        *dirty = true;
+    }
+    WAKE.1.notify_all();
+}
 
 const VK_MEDIA_NEXT_TRACK: VIRTUAL_KEY = VIRTUAL_KEY(0xB0);
 const VK_MEDIA_PREV_TRACK: VIRTUAL_KEY = VIRTUAL_KEY(0xB1);
@@ -135,7 +175,7 @@ const VK_MEDIA_PLAY_PAUSE: VIRTUAL_KEY = VIRTUAL_KEY(0xB3);
 
 /// Slider fraction (0..1) for a mouse message's client X coordinate.
 fn slider_frac(lparam: LPARAM) -> f32 {
-    let s = unsafe { GetDpiForSystem() } as f32 / 96.0;
+    let s = scale();
     let mx = (lparam.0 & 0xFFFF) as i16 as f32 / s;
     ((mx - SLIDER_X0) / (SLIDER_X1 - SLIDER_X0)).clamp(0.0, 1.0)
 }
@@ -145,6 +185,33 @@ fn push_media_cmd(cmd: u8) {
         if q.len() < 16 {
             q.push(cmd);
         }
+    }
+    wake_media_thread();
+}
+
+/// Which control sits under the cursor (logical px, window client space):
+/// 0 none, 1 previous, 2 play/pause, 3 next, 4 seek slider.
+fn hit_test(mx: f32, my: f32, media_active: bool) -> u8 {
+    if !media_active {
+        return 0;
+    }
+    if (my - CY_BTN).abs() <= BTN_HIT_R {
+        if (mx - CX_PREV).abs() <= BTN_SEC_R {
+            1
+        } else if (mx - CX_PLAY).abs() <= BTN_HIT_R {
+            2
+        } else if (mx - CX_NEXT).abs() <= BTN_SEC_R {
+            3
+        } else {
+            0
+        }
+    } else if (my - SLIDER_Y).abs() <= SLIDER_HIT_HALF_H
+        && mx >= SLIDER_X0 - SLIDER_HIT_PAD
+        && mx <= SLIDER_X1 + SLIDER_HIT_PAD
+    {
+        4
+    } else {
+        0
     }
 }
 
@@ -159,9 +226,21 @@ fn send_fallback_key(cmd: u8) {
 }
 
 fn send_media_key(vk: VIRTUAL_KEY) {
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS::default()), key(KEYEVENTF_KEYUP)];
     unsafe {
-        keybd_event(vk.0 as u8, 0, Default::default(), 0);
-        keybd_event(vk.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
@@ -180,6 +259,21 @@ struct MediaInfo {
     sampled_at: Option<Instant>,
 }
 
+/// Slider position (0..1) for the current media state, extrapolated while playing.
+fn playback_progress(media: &MediaInfo) -> f32 {
+    if media.duration_secs > 0.5 {
+        let mut ps = media.position_secs;
+        if media.is_playing {
+            if let Some(t) = media.sampled_at {
+                ps += t.elapsed().as_secs_f32();
+            }
+        }
+        (ps / media.duration_secs).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// Current time as a Windows FILETIME value (100 ns ticks since 1601).
 fn now_filetime() -> i64 {
     SystemTime::now()
@@ -195,6 +289,18 @@ const THUMB_SIZE: u32 = 96;
 const ASYNC_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often to retry decoding a track's thumbnail while it is still missing.
 const MAX_THUMB_TRIES: u32 = 10;
+
+/// Scale so the shorter side equals `size`, then centre-crop to a square.
+/// Returns (scaled_width, scaled_height, crop_x, crop_y).
+fn cover_crop(iw: u32, ih: u32, size: u32) -> Option<(u32, u32, u32, u32)> {
+    if iw == 0 || ih == 0 || size == 0 {
+        return None;
+    }
+    let k = size as f32 / iw.min(ih) as f32;
+    let sw = ((iw as f32 * k).round() as u32).max(size);
+    let sh = ((ih as f32 * k).round() as u32).max(size);
+    Some((sw, sh, (sw - size) / 2, (sh - size) / 2))
+}
 
 /// Wait for a WinRT async operation with a timeout (cancelling it when the time is up).
 fn wait_timeout<T: windows::core::RuntimeType + 'static>(
@@ -224,9 +330,14 @@ fn thumb_changed(a: &Option<Arc<Vec<u8>>>, b: &Option<Arc<Vec<u8>>>) -> bool {
 fn decode_thumbnail(thumb_ref: &IRandomAccessStreamReference, size: u32) -> Option<(u32, u32, Vec<u8>)> {
     let stream = wait_timeout(&thumb_ref.OpenReadAsync().ok()?, ASYNC_TIMEOUT)?;
     let decoder = wait_timeout(&BitmapDecoder::CreateAsync(&stream).ok()?, ASYNC_TIMEOUT)?;
+    let (iw, ih) = (decoder.PixelWidth().ok()?, decoder.PixelHeight().ok()?);
+    let (sw, sh, cx, cy) = cover_crop(iw, ih, size)?;
     let transform = BitmapTransform::new().ok()?;
-    transform.SetScaledWidth(size).ok()?;
-    transform.SetScaledHeight(size).ok()?;
+    transform.SetScaledWidth(sw).ok()?;
+    transform.SetScaledHeight(sh).ok()?;
+    transform
+        .SetBounds(BitmapBounds { X: cx, Y: cy, Width: size, Height: size })
+        .ok()?;
     transform.SetInterpolationMode(BitmapInterpolationMode::Linear).ok()?;
     let pixel_data = wait_timeout(
         &decoder
@@ -240,8 +351,60 @@ fn decode_thumbnail(thumb_ref: &IRandomAccessStreamReference, size: u32) -> Opti
             .ok()?,
         ASYNC_TIMEOUT,
     )?;
-    let data = pixel_data.DetachPixelData().ok()?;
-    Some((size, size, data.to_vec()))
+    let data = pixel_data.DetachPixelData().ok()?.to_vec();
+    if data.len() != (size * size * 4) as usize {
+        return None; // unexpected size (e.g. EXIF-rotated art): better no cover than a garbled one
+    }
+    Some((size, size, data))
+}
+
+/// Event registrations on the current media session. Every handler only wakes the media
+/// thread, which then re-reads the state; this replaces constant polling.
+struct Subscription {
+    session: GlobalSystemMediaTransportControlsSession,
+    app_id: String,
+    tokens: [EventRegistrationToken; 3],
+}
+
+impl Subscription {
+    fn new(session: &GlobalSystemMediaTransportControlsSession, app_id: String) -> Option<Self> {
+        type S = GlobalSystemMediaTransportControlsSession;
+        let props = session
+            .MediaPropertiesChanged(&TypedEventHandler::<S, MediaPropertiesChangedEventArgs>::new(
+                |_, _| {
+                    wake_media_thread();
+                    Ok(())
+                },
+            ))
+            .ok()?;
+        let playback = session
+            .PlaybackInfoChanged(&TypedEventHandler::<S, PlaybackInfoChangedEventArgs>::new(
+                |_, _| {
+                    wake_media_thread();
+                    Ok(())
+                },
+            ))
+            .ok()?;
+        let timeline = session
+            .TimelinePropertiesChanged(
+                &TypedEventHandler::<S, TimelinePropertiesChangedEventArgs>::new(|_, _| {
+                    wake_media_thread();
+                    Ok(())
+                }),
+            )
+            .ok()?;
+        Some(Self {
+            session: session.clone(),
+            app_id,
+            tokens: [props, playback, timeline],
+        })
+    }
+
+    fn cancel(self) {
+        let _ = self.session.RemoveMediaPropertiesChanged(self.tokens[0]);
+        let _ = self.session.RemovePlaybackInfoChanged(self.tokens[1]);
+        let _ = self.session.RemoveTimelinePropertiesChanged(self.tokens[2]);
+    }
 }
 
 struct MediaController {
@@ -265,6 +428,7 @@ impl MediaController {
             let mut last_has_session = false;
             let mut last_thumb: Option<Arc<Vec<u8>>> = None;
             let mut thumb_tries = 0u32;
+            let mut subscription: Option<Subscription> = None;
             let mut last_thumb_w = 0u32;
             let mut last_thumb_h = 0u32;
 
@@ -273,6 +437,15 @@ impl MediaController {
                     manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
                         .ok()
                         .and_then(|op| wait_timeout(&op, ASYNC_TIMEOUT));
+                    if let Some(ref mgr) = manager {
+                        let _ = mgr.CurrentSessionChanged(&TypedEventHandler::<
+                            GlobalSystemMediaTransportControlsSessionManager,
+                            CurrentSessionChangedEventArgs,
+                        >::new(|_, _| {
+                            wake_media_thread();
+                            Ok(())
+                        }));
+                    }
                 }
 
                 let cmds: Vec<u8> = MEDIA_CMDS
@@ -283,6 +456,16 @@ impl MediaController {
 
                 if let Some(ref mgr) = manager {
                     if let Ok(session) = mgr.GetCurrentSession() {
+                        let app_id = session
+                            .SourceAppUserModelId()
+                            .map(|a| a.to_string_lossy())
+                            .unwrap_or_default();
+                        if subscription.as_ref().map_or(true, |sub| sub.app_id != app_id) {
+                            if let Some(old) = subscription.take() {
+                                old.cancel();
+                            }
+                            subscription = Subscription::new(&session, app_id);
+                        }
                         for &cmd in &cmds {
                             match cmd {
                                 CMD_TOGGLE => {
@@ -364,7 +547,7 @@ impl MediaController {
                         let mut position_secs = (tl_pos - tl_start).max(0) as f64 / 1e7;
                         if is_playing && tl_upd > 0 {
                             let behind = (now_filetime() - tl_upd) as f64 / 1e7;
-                            if behind > 0.0 && behind < 6.0 * 3600.0 {
+                            if behind > 0.0 && behind < STALE_TIMELINE_SECS {
                                 position_secs += behind;
                             }
                         }
@@ -398,6 +581,9 @@ impl MediaController {
                             lock.sampled_at = Some(Instant::now());
                         }
                     } else {
+                        if let Some(old) = subscription.take() {
+                            old.cancel();
+                        }
                         // Fallback media keys if no active session
                         for &cmd in &cmds {
                             send_fallback_key(cmd);
@@ -422,7 +608,14 @@ impl MediaController {
                     }
                 }
 
-                thread::sleep(Duration::from_millis(150));
+                // Sleep until an event, command or seek wakes us (or the safety refresh is due).
+                if let Ok(guard) = WAKE.0.lock() {
+                    if let Ok((mut dirty, _)) =
+                        WAKE.1.wait_timeout_while(guard, REFRESH_INTERVAL, |d| !*d)
+                    {
+                        *dirty = false;
+                    }
+                }
             }
         });
 
@@ -1080,11 +1273,60 @@ fn sample(mask: &[u8], hw: i32, hh: i32, x: i32, y: i32, dy_hi: i32) -> f32 {
     sum as f32 / (SS * SS * 255) as f32
 }
 
+/// Time and date strings in the user's locale (12/24 h clock, short date, weekday).
+/// Falls back to a fixed numeric format if the system calls fail.
+unsafe fn locale_strings(t: &SYSTEMTIME) -> (String, String) {
+    fn text(buf: &[u16], n: i32) -> Option<String> {
+        (n > 1).then(|| String::from_utf16_lossy(&buf[..(n - 1) as usize]))
+    }
+    let tp = Some(t as *const SYSTEMTIME);
+
+    let mut tbuf = [0u16; 64];
+    let n = GetTimeFormatEx(
+        PCWSTR::null(),
+        TIME_NOSECONDS | TIME_NOTIMEMARKER,
+        tp,
+        PCWSTR::null(),
+        Some(&mut tbuf[..]),
+    );
+    let time = text(&tbuf, n).unwrap_or_else(|| format!("{:02}:{:02}", t.wHour, t.wMinute));
+
+    let mut wbuf = [0u16; 32];
+    let n = GetDateFormatEx(
+        PCWSTR::null(),
+        ENUM_DATE_FORMATS_FLAGS(0),
+        tp,
+        w!("ddd"),
+        Some(&mut wbuf[..]),
+        PCWSTR::null(),
+    );
+    let weekday = text(&wbuf, n);
+
+    let mut dbuf = [0u16; 64];
+    let n = GetDateFormatEx(
+        PCWSTR::null(),
+        DATE_SHORTDATE,
+        tp,
+        PCWSTR::null(),
+        Some(&mut dbuf[..]),
+        PCWSTR::null(),
+    );
+    let day = text(&dbuf, n)
+        .unwrap_or_else(|| format!("{:02}.{:02}.{}", t.wDay, t.wMonth, t.wYear));
+
+    let date = match weekday {
+        Some(w) => format!("{} {}", w, day),
+        None => day,
+    };
+    (time, date)
+}
+
 struct Renderer {
     w: i32,
     h: i32,
     s: f32,
     mem_dc: HDC,
+    bmp: HBITMAP,
     bits: *mut u32,
     time_mask: Vec<u8>,
     date_mask: Vec<u8>,
@@ -1118,6 +1360,15 @@ struct Renderer {
     thumb_pixels: Option<Arc<Vec<u8>>>,
 
     icons: IconSet,
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.mem_dc);
+            let _ = DeleteObject(self.bmp);
+        }
+    }
 }
 
 impl Renderer {
@@ -1166,6 +1417,7 @@ impl Renderer {
             h,
             s,
             mem_dc,
+            bmp,
             bits: bits as *mut u32,
             time_mask: Vec::new(),
             date_mask: Vec::new(),
@@ -1214,15 +1466,7 @@ impl Renderer {
         }
         self.key = key;
 
-        const DAYS: [&str; 7] = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
-        let time = format!("{:02}:{:02}", t.wHour, t.wMinute);
-        let date = format!(
-            "{} {:02}.{:02}.{}",
-            DAYS[(t.wDayOfWeek as usize) % 7],
-            t.wDay,
-            t.wMonth,
-            t.wYear
-        );
+        let (time, date) = locale_strings(&t);
         let hw = self.w * SS;
         self.time_mask = render_mask(
             &time,
@@ -1276,7 +1520,7 @@ impl Renderer {
             self.media_title = title.to_string();
             self.media_title_mask = render_mask_ex(
                 title,
-                (12.5 * self.s * SS as f32).round() as i32,
+                (MEDIA_TITLE_FONT * self.s * SS as f32).round() as i32,
                 600,
                 self.media_title_hw,
                 self.media_title_hh,
@@ -1349,17 +1593,7 @@ impl Renderer {
         }
 
         // Playback progress for the slider
-        let progress = if media.duration_secs > 0.5 {
-            let mut ps = media.position_secs;
-            if media.is_playing {
-                if let Some(t) = media.sampled_at {
-                    ps += t.elapsed().as_secs_f32();
-                }
-            }
-            (ps / media.duration_secs).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let progress = playback_progress(media);
 
         // ---- Rings (CPU on top, RAM below, labels to the right) ----
         struct Ring<'a> {
@@ -1484,9 +1718,9 @@ impl Renderer {
             let fy = y as f32 + 0.5;
 
             let in_art_y = has_media && (fy - art_cy).abs() < art_sz / 2.0 + 1.5;
-            let in_viz_y = show_viz && (fy - viz_cy).abs() < 14.0 * s;
+            let in_viz_y = show_viz && (fy - viz_cy).abs() < VIZ_BAND * s;
             let in_title_y = show_media && fy > title_top - 2.0 && fy < title_top + title_h + 2.0;
-            let in_slider_y = show_media && (fy - sl_y).abs() < 9.0 * s;
+            let in_slider_y = show_media && (fy - sl_y).abs() < SLIDER_BAND * s;
             let in_btn_y = show_media && (fy - btn_cy).abs() < ic_half + 1.0;
 
             for x in x0..=x1 {
@@ -1611,7 +1845,7 @@ impl Renderer {
                     } else {
                         0.0
                     };
-                    let knob_r = (if hover_btn == 4 { 5.5 } else { 4.5 }) * s;
+                    let knob_r = (if hover_btn == 4 { KNOB_R_HOVER } else { KNOB_R }) * s;
                     let knob = sdf_circle_cov(fx, fy, sl_px, sl_y, knob_r);
                     let base = (130.0 * (1.0 - filled) + 235.0 * filled) * track;
                     let v = (base * (1.0 - knob) + 255.0 * knob) * fade;
@@ -1695,8 +1929,11 @@ fn qpc() -> i64 {
 
 fn main() -> windows::core::Result<()> {
     unsafe {
-        let _ = SetProcessDPIAware();
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
+            let _ = SetProcessDPIAware();
+        }
         let s = GetDpiForSystem() as f32 / 96.0;
+        set_scale(s);
 
         // Only one island at a time: a second launch exits immediately.
         let _instance = CreateMutexW(None, BOOL(0), w!("Local\\AtollSingleInstance"))?;
@@ -1736,6 +1973,12 @@ fn main() -> windows::core::Result<()> {
             None,
         )?;
 
+        // Use the DPI of the monitor the window actually landed on.
+        let s = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        set_scale(s);
+        place_window(hwnd, s);
+        let (win_w, win_h) = window_size(s);
+
         let mut sys_mon = SystemMonitor::new();
         let mut target_cpu = sys_mon.cpu_usage;
         let mut target_ram = sys_mon.ram_usage;
@@ -1759,6 +2002,7 @@ fn main() -> windows::core::Result<()> {
         let mut vel = 0.0f32;
         let mut last = qpc();
         let mut was_animating = false;
+        let mut force_draw = false; // redraw even if nothing is animating (after a rescale)
         let mut drag_release: Option<i64> = None; // when the slider drag ended (keeps the knob put until the player catches up)
         let mut music_w = 0.0f32; // eases the collapsed pill wider while media is present
         let initial_time = GetLocalTime();
@@ -1772,6 +2016,16 @@ fn main() -> windows::core::Result<()> {
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+
+            if RESCALE.swap(false, Ordering::Relaxed) {
+                // Monitor DPI changed: rebuild the renderer (icons, masks) at the new scale.
+                let s = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                set_scale(s);
+                place_window(hwnd, s);
+                let (w, h) = window_size(s);
+                r = Renderer::new(w, h, s);
+                force_draw = true;
             }
 
             let now = qpc();
@@ -1879,7 +2133,13 @@ fn main() -> windows::core::Result<()> {
             let t = GetLocalTime();
             let minute_key = t.wHour as u32 * 60 + t.wMinute as u32;
 
-            if animating || was_animating || media_changed || slider_live || minute_key != last_minute_key {
+            if animating
+                || was_animating
+                || media_changed
+                || slider_live
+                || force_draw
+                || minute_key != last_minute_key
+            {
                 last_minute_key = minute_key;
                 r.draw(
                     hwnd,
@@ -1893,6 +2153,7 @@ fn main() -> windows::core::Result<()> {
                 );
             }
             was_animating = animating;
+            force_draw = false;
 
             if animating {
                 // Block until the next compositor vblank: real vsync pacing.
@@ -1907,13 +2168,27 @@ fn main() -> windows::core::Result<()> {
     }
 }
 
-/// Centre the (fixed-size) window at the top of the primary monitor.
-unsafe fn reposition(hwnd: HWND) {
-    let s = GetDpiForSystem() as f32 / 96.0;
-    let win_w = (EXPANDED_W * s).ceil() as i32 + 2;
+/// Fixed window size (the expanded pill plus a 1 px margin) at scale `s`.
+fn window_size(s: f32) -> (i32, i32) {
+    ((EXPANDED_W * s).ceil() as i32 + 2, (EXPANDED_H * s).ceil() as i32 + 2)
+}
+
+/// Size the window for scale `s` and centre it at the top of the primary monitor.
+unsafe fn place_window(hwnd: HWND, s: f32) {
+    let (win_w, win_h) = window_size(s);
     let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
     let y = (TOP_MARGIN * s).round() as i32;
-    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    let _ = SetWindowPos(hwnd, None, x, y, win_w, win_h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/// After a modal interaction (context menu): collapse if the cursor is no longer over the pill.
+unsafe fn collapse_if_cursor_away(hwnd: HWND) {
+    TRACKING.store(false, Ordering::Relaxed);
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_ok() && WindowFromPoint(pt) != hwnd && !PINNED.load(Ordering::Relaxed) {
+        TARGET_EXPANDED.store(false, Ordering::Relaxed);
+        HOVER_BTN.store(0, Ordering::Relaxed);
+    }
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1933,23 +2208,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = TrackMouseEvent(&mut tme);
                 }
 
-                let s = GetDpiForSystem() as f32 / 96.0;
+                let s = scale();
                 let mx = (lparam.0 & 0xFFFF) as i16 as f32 / s;
                 let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / s;
-                let mut btn = 0u8;
-                if MEDIA_ACTIVE.load(Ordering::Relaxed) {
-                    if (my - CY_BTN).abs() <= BTN_HIT_R {
-                        if (mx - CX_PREV).abs() <= BTN_SEC_R {
-                            btn = 1; // Prev
-                        } else if (mx - CX_PLAY).abs() <= BTN_HIT_R {
-                            btn = 2; // Play/Pause
-                        } else if (mx - CX_NEXT).abs() <= BTN_SEC_R {
-                            btn = 3; // Next
-                        }
-                    } else if (my - SLIDER_Y).abs() <= 8.0 && mx >= SLIDER_X0 - 4.0 && mx <= SLIDER_X1 + 4.0 {
-                        btn = 4; // Seek slider
-                    }
-                }
+                let mut btn = hit_test(mx, my, MEDIA_ACTIVE.load(Ordering::Relaxed));
                 if DRAGGING.load(Ordering::Relaxed) {
                     let pm = (slider_frac(lparam) * 1000.0).round() as u32 + 1;
                     DRAG_FRAC.store(pm, Ordering::Relaxed);
@@ -1971,7 +2233,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_DISPLAYCHANGE => {
                 // Resolution or monitor layout changed: keep the island centred.
-                reposition(hwnd);
+                place_window(hwnd, scale());
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                // The main loop rebuilds the renderer at the new scale.
+                RESCALE.store(true, Ordering::Relaxed);
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
@@ -1989,6 +2256,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     PRESSED_BTN.store(NO_PRESS, Ordering::Relaxed);
                     let pm = (slider_frac(lparam) * 1000.0).round() as u32 + 1;
                     MEDIA_SEEK.store(pm, Ordering::Relaxed);
+                    wake_media_thread();
                     DRAG_FRAC.store(pm, Ordering::Relaxed);
                     TRACKING.store(false, Ordering::Relaxed);
                     let mut pt = POINT::default();
@@ -2021,7 +2289,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
-                let _ = DestroyWindow(hwnd);
+                // Context menu instead of quitting on a stray right-click.
+                if let Ok(menu) = CreatePopupMenu() {
+                    let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit Atoll"));
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let _ = SetForegroundWindow(hwnd);
+                    let chosen = TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                        pt.x,
+                        pt.y,
+                        0,
+                        hwnd,
+                        None,
+                    );
+                    let _ = DestroyMenu(menu);
+                    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+                    if chosen.0 == ID_QUIT as i32 {
+                        let _ = DestroyWindow(hwnd);
+                    } else {
+                        collapse_if_cursor_away(hwnd);
+                    }
+                }
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -2158,5 +2448,37 @@ mod tests {
         push_media_cmd(CMD_NEXT);
         let drained = std::mem::take(&mut *MEDIA_CMDS.lock().unwrap());
         assert_eq!(drained, vec![CMD_NEXT, CMD_NEXT]);
+    }
+
+    #[test]
+    fn test_cover_crop() {
+        assert_eq!(cover_crop(100, 100, 96), Some((96, 96, 0, 0)));
+        assert_eq!(cover_crop(200, 100, 96), Some((192, 96, 48, 0)));
+        assert_eq!(cover_crop(100, 200, 96), Some((96, 192, 0, 48)));
+        assert_eq!(cover_crop(0, 100, 96), None);
+        // Tiny art is upscaled, never cropped below the target size.
+        let (sw, sh, x, y) = cover_crop(10, 20, 96).unwrap();
+        assert!(sw >= 96 && sh >= 96 && x + 96 <= sw && y + 96 <= sh);
+    }
+
+    #[test]
+    fn test_hit_test() {
+        assert_eq!(hit_test(CX_PREV, CY_BTN, true), 1);
+        assert_eq!(hit_test(CX_PLAY, CY_BTN, true), 2);
+        assert_eq!(hit_test(CX_NEXT, CY_BTN, true), 3);
+        assert_eq!(hit_test((SLIDER_X0 + SLIDER_X1) / 2.0, SLIDER_Y, true), 4);
+        assert_eq!(hit_test(CX_PLAY, CY_BTN, false), 0, "no controls without a media session");
+        assert_eq!(hit_test(0.0, 0.0, true), 0);
+    }
+
+    #[test]
+    fn test_playback_progress() {
+        let mut m = MediaInfo::default();
+        assert_eq!(playback_progress(&m), 0.0, "no duration -> 0");
+        m.duration_secs = 100.0;
+        m.position_secs = 25.0;
+        assert!((playback_progress(&m) - 0.25).abs() < 1e-6);
+        m.position_secs = 500.0;
+        assert_eq!(playback_progress(&m), 1.0, "clamped at the end");
     }
 }
